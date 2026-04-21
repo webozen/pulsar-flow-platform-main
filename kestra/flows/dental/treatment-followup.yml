@@ -1,0 +1,166 @@
+id: treatment-followup
+namespace: dental
+description: >
+  Polls for treatment-planned procedures older than 14 days with no
+  scheduled appointment. Sends patient outreach, waits 7 days, then
+  escalates to front desk if still unscheduled.
+
+labels:
+  workflow-type: treatment-followup
+
+triggers:
+  - id: poll_unscheduled_treatments
+    type: io.kestra.plugin.jdbc.mysql.Trigger
+    url: "{{ kv('opendental_jdbc_url') }}"
+    username: "{{ kv('opendental_db_user') }}"
+    password: "{{ secret('OPENDENTAL_DB_PASSWORD') }}"
+    sql: |
+      SELECT
+        pl.ProcNum,
+        pl.PatNum,
+        pl.ProcDate,
+        pc.Descript AS ProcedureDescription,
+        pc.ProcCode,
+        p.FName,
+        p.LName,
+        p.Email,
+        p.WirelessPhone
+      FROM procedurelog pl
+      JOIN procedurecode pc ON pc.CodeNum = pl.CodeNum
+      JOIN patient p ON p.PatNum = pl.PatNum
+      LEFT JOIN appointment a
+        ON a.PatNum = pl.PatNum
+        AND a.AptStatus = 1
+        AND a.AptDateTime > NOW()
+      WHERE pl.ProcStatus = 1
+        AND pl.ProcDate < DATE_SUB(CURDATE(), INTERVAL 14 DAY)
+        AND pl.ProcDate > DATE_SUB(CURDATE(), INTERVAL 180 DAY)
+        AND p.PatStatus = 0
+        AND a.AptNum IS NULL
+      ORDER BY pl.ProcDate ASC
+      LIMIT 50
+    interval: P1D
+    fetchType: FETCH_ONE
+
+tasks:
+  - id: check_dedup
+    type: io.kestra.plugin.jdbc.mysql.Query
+    url: "{{ kv('opendental_jdbc_url') }}"
+    username: "{{ kv('opendental_db_user') }}"
+    password: "{{ secret('OPENDENTAL_DB_PASSWORD') }}"
+    sql: |
+      SELECT COUNT(*) as cnt
+      FROM dental_automation_log
+      WHERE patient_id = {{ trigger.row.PatNum }}
+        AND workflow_type = 'treatment_followup'
+        AND created_at > DATE_SUB(NOW(), INTERVAL 30 DAY)
+    fetchType: FETCH_ONE
+
+  - id: process_if_new
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ outputs.check_dedup.row.cnt == 0 }}"
+    then:
+      # Phase 1: Send patient outreach (SMS + email)
+      - id: send_sms
+        type: io.kestra.plugin.core.flow.If
+        condition: "{{ trigger.row.WirelessPhone != null and trigger.row.WirelessPhone != '' }}"
+        then:
+          - id: sms_treatment_reminder
+            type: io.kestra.plugin.core.http.Request
+            uri: "https://api.twilio.com/2010-04-01/Accounts/{{ kv('twilio_sid') }}/Messages.json"
+            method: POST
+            headers:
+              Content-Type: application/x-www-form-urlencoded
+            basicAuthUser: "{{ kv('twilio_sid') }}"
+            basicAuthPassword: "{{ secret('TWILIO_AUTH_TOKEN') }}"
+            body: >
+              To={{ trigger.row.WirelessPhone }}&From={{ kv('twilio_from_number') }}&Body=Hi {{ trigger.row.FName }}, this is {{ kv('clinic_name') }}. We wanted to follow up on your recommended treatment plan. Please call us at {{ kv('clinic_phone') }} to schedule your visit.
+
+      - id: send_email
+        type: io.kestra.plugin.core.flow.If
+        condition: "{{ trigger.row.Email != null and trigger.row.Email != '' }}"
+        then:
+          - id: email_treatment_reminder
+            type: io.kestra.plugin.notifications.mail.MailSend
+            host: "{{ kv('smtp_host') }}"
+            port: "{{ kv('smtp_port') }}"
+            username: "{{ kv('smtp_username') }}"
+            password: "{{ secret('SMTP_PASSWORD') }}"
+            from: "{{ kv('smtp_from') }}"
+            to:
+              - "{{ trigger.row.Email }}"
+            subject: "Follow up on your treatment plan - {{ kv('clinic_name') }}"
+            htmlTextContent: |
+              <h2>Hi {{ trigger.row.FName }},</h2>
+              <p>During your recent visit, we recommended the following treatment:</p>
+              <p><strong>{{ trigger.row.ProcedureDescription }}</strong> ({{ trigger.row.ProcCode }})</p>
+              <p>We want to make sure you get the care you need. Please call us at
+              <strong>{{ kv('clinic_phone') }}</strong> to schedule your appointment.</p>
+              <p>Best regards,<br/>{{ kv('clinic_name') }}</p>
+
+      - id: log_outreach
+        type: io.kestra.plugin.jdbc.mysql.Query
+        url: "{{ kv('opendental_jdbc_url') }}"
+        username: "{{ kv('opendental_db_user') }}"
+        password: "{{ secret('OPENDENTAL_DB_PASSWORD') }}"
+        sql: |
+          INSERT INTO dental_automation_log
+            (patient_id, workflow_type, channel, status, metadata_json, created_at)
+          VALUES
+            ({{ trigger.row.PatNum }}, 'treatment_followup', 'sms_email', 'sent',
+             '{"ProcNum":{{ trigger.row.ProcNum }}, "ProcCode":"{{ trigger.row.ProcCode }}"}', NOW())
+
+      # Phase 2: Wait 7 days
+      - id: wait_7_days
+        type: io.kestra.plugin.core.flow.Pause
+        delay: P7D
+
+      # Phase 3: Re-check if patient has scheduled
+      - id: recheck_scheduled
+        type: io.kestra.plugin.jdbc.mysql.Query
+        url: "{{ kv('opendental_jdbc_url') }}"
+        username: "{{ kv('opendental_db_user') }}"
+        password: "{{ secret('OPENDENTAL_DB_PASSWORD') }}"
+        sql: |
+          SELECT COUNT(*) as has_appt
+          FROM appointment
+          WHERE PatNum = {{ trigger.row.PatNum }}
+            AND AptStatus = 1
+            AND AptDateTime > NOW()
+        fetchType: FETCH_ONE
+
+      # Phase 4: Escalate to front desk if still unscheduled
+      - id: escalate_if_unscheduled
+        type: io.kestra.plugin.core.flow.If
+        condition: "{{ outputs.recheck_scheduled.row.has_appt == 0 }}"
+        then:
+          - id: notify_front_desk
+            type: io.kestra.plugin.notifications.mail.MailSend
+            host: "{{ kv('smtp_host') }}"
+            port: "{{ kv('smtp_port') }}"
+            username: "{{ kv('smtp_username') }}"
+            password: "{{ secret('SMTP_PASSWORD') }}"
+            from: "{{ kv('smtp_from') }}"
+            to:
+              - "{{ kv('front_desk_email') }}"
+            subject: "ESCALATION: {{ trigger.row.FName }} {{ trigger.row.LName }} - unscheduled treatment"
+            htmlTextContent: |
+              <h2>Patient Treatment Plan Follow-Up Escalation</h2>
+              <p><strong>Patient:</strong> {{ trigger.row.FName }} {{ trigger.row.LName }} (PatNum: {{ trigger.row.PatNum }})</p>
+              <p><strong>Procedure:</strong> {{ trigger.row.ProcedureDescription }} ({{ trigger.row.ProcCode }})</p>
+              <p><strong>Treatment planned on:</strong> {{ trigger.row.ProcDate }}</p>
+              <p><strong>Phone:</strong> {{ trigger.row.WirelessPhone }}</p>
+              <p>This patient was contacted 7 days ago but has not yet scheduled.
+              Please reach out directly to assist with scheduling.</p>
+
+          - id: log_escalation
+            type: io.kestra.plugin.jdbc.mysql.Query
+            url: "{{ kv('opendental_jdbc_url') }}"
+            username: "{{ kv('opendental_db_user') }}"
+            password: "{{ secret('OPENDENTAL_DB_PASSWORD') }}"
+            sql: |
+              INSERT INTO dental_automation_log
+                (patient_id, workflow_type, channel, status, metadata_json, created_at)
+              VALUES
+                ({{ trigger.row.PatNum }}, 'treatment_followup', 'internal', 'escalated',
+                 '{"ProcNum":{{ trigger.row.ProcNum }}}', NOW())

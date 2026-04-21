@@ -1,0 +1,28 @@
+# Docker
+docker-compose.override.yml
+
+# Kestra
+kestra/data/
+
+# IDE
+.idea/
+*.iml
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Env / secrets
+.env
+.env.local
+.env.*.local
+
+# Obsidian local workspace
+docs/.obsidian/workspace.json
+docs/.obsidian/workspace-mobile.json
+docs/.obsidian/workspaces.json
+
+# Logs
+*.log
+logs/

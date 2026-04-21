@@ -1,0 +1,127 @@
+id: claims-followup
+namespace: dental
+description: >
+  Polls for insurance claims older than 30 days that haven't been
+  received/paid. Creates a human approval task for the billing team
+  to review before sending follow-up notifications.
+
+labels:
+  workflow-type: claims-followup
+
+triggers:
+  - id: poll_stale_claims
+    type: io.kestra.plugin.jdbc.mysql.Trigger
+    url: "{{ kv('opendental_jdbc_url') }}"
+    username: "{{ kv('opendental_db_user') }}"
+    password: "{{ secret('OPENDENTAL_DB_PASSWORD') }}"
+    sql: |
+      SELECT
+        c.ClaimNum,
+        c.PatNum,
+        c.ClaimStatus,
+        c.DateSent,
+        c.ClaimFee,
+        c.InsPayAmt,
+        p.FName,
+        p.LName,
+        cp.CarrierName,
+        cp.Phone AS CarrierPhone,
+        ip.SubscriberID
+      FROM claim c
+      JOIN patient p ON p.PatNum = c.PatNum
+      JOIN insplan ip ON ip.PlanNum = c.PlanNum
+      JOIN carrier cp ON cp.CarrierNum = ip.CarrierNum
+      WHERE c.ClaimStatus IN ('S', 'W')
+        AND c.DateSent < DATE_SUB(CURDATE(), INTERVAL 30 DAY)
+        AND c.DateSent > DATE_SUB(CURDATE(), INTERVAL 180 DAY)
+      ORDER BY c.DateSent ASC
+      LIMIT 50
+    interval: P1D
+    fetchType: FETCH_ONE
+
+tasks:
+  - id: check_dedup
+    type: io.kestra.plugin.jdbc.mysql.Query
+    url: "{{ kv('opendental_jdbc_url') }}"
+    username: "{{ kv('opendental_db_user') }}"
+    password: "{{ secret('OPENDENTAL_DB_PASSWORD') }}"
+    sql: |
+      SELECT COUNT(*) as cnt
+      FROM dental_automation_log
+      WHERE patient_id = {{ trigger.row.PatNum }}
+        AND workflow_type = 'claims_followup'
+        AND metadata_json LIKE '%"ClaimNum":{{ trigger.row.ClaimNum }}%'
+        AND created_at > DATE_SUB(NOW(), INTERVAL 60 DAY)
+    fetchType: FETCH_ONE
+
+  - id: process_if_new
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ outputs.check_dedup.row.cnt == 0 }}"
+    then:
+      - id: log_claim_flagged
+        type: io.kestra.plugin.jdbc.mysql.Query
+        url: "{{ kv('opendental_jdbc_url') }}"
+        username: "{{ kv('opendental_db_user') }}"
+        password: "{{ secret('OPENDENTAL_DB_PASSWORD') }}"
+        sql: |
+          INSERT INTO dental_automation_log
+            (patient_id, workflow_type, channel, status, metadata_json, created_at)
+          VALUES
+            ({{ trigger.row.PatNum }}, 'claims_followup', 'internal', 'flagged',
+             '{"ClaimNum":{{ trigger.row.ClaimNum }}, "CarrierName":"{{ trigger.row.CarrierName }}"}', NOW())
+
+      # Human approval gate — billing team reviews in Kestra UI
+      - id: await_billing_review
+        type: io.kestra.plugin.core.flow.Pause
+        # No delay = waits indefinitely for human resume via Kestra UI or API
+
+      # After human approves, re-check the claim hasn't been resolved while waiting
+      - id: recheck_claim_status
+        type: io.kestra.plugin.jdbc.mysql.Query
+        url: "{{ kv('opendental_jdbc_url') }}"
+        username: "{{ kv('opendental_db_user') }}"
+        password: "{{ secret('OPENDENTAL_DB_PASSWORD') }}"
+        sql: |
+          SELECT c.ClaimStatus
+          FROM claim c
+          WHERE c.ClaimNum = {{ trigger.row.ClaimNum }}
+        fetchType: FETCH_ONE
+
+      - id: notify_if_still_outstanding
+        type: io.kestra.plugin.core.flow.If
+        condition: "{{ outputs.recheck_claim_status.row.ClaimStatus == 'S' or outputs.recheck_claim_status.row.ClaimStatus == 'W' }}"
+        then:
+          - id: send_billing_notification
+            type: io.kestra.plugin.notifications.mail.MailSend
+            host: "{{ kv('smtp_host') }}"
+            port: "{{ kv('smtp_port') }}"
+            username: "{{ kv('smtp_username') }}"
+            password: "{{ secret('SMTP_PASSWORD') }}"
+            from: "{{ kv('smtp_from') }}"
+            to:
+              - "{{ kv('billing_team_email') }}"
+            subject: "Action Required: Stale claim #{{ trigger.row.ClaimNum }} for {{ trigger.row.FName }} {{ trigger.row.LName }}"
+            htmlTextContent: |
+              <h2>Insurance Claim Follow-Up Required</h2>
+              <table>
+                <tr><td><strong>Patient:</strong></td><td>{{ trigger.row.FName }} {{ trigger.row.LName }}</td></tr>
+                <tr><td><strong>Claim #:</strong></td><td>{{ trigger.row.ClaimNum }}</td></tr>
+                <tr><td><strong>Date Sent:</strong></td><td>{{ trigger.row.DateSent }}</td></tr>
+                <tr><td><strong>Claim Amount:</strong></td><td>${{ trigger.row.ClaimFee }}</td></tr>
+                <tr><td><strong>Carrier:</strong></td><td>{{ trigger.row.CarrierName }}</td></tr>
+                <tr><td><strong>Carrier Phone:</strong></td><td>{{ trigger.row.CarrierPhone }}</td></tr>
+                <tr><td><strong>Subscriber ID:</strong></td><td>{{ trigger.row.SubscriberID }}</td></tr>
+              </table>
+              <p>This claim has been outstanding for over 30 days. Please follow up with the carrier.</p>
+
+          - id: log_notification_sent
+            type: io.kestra.plugin.jdbc.mysql.Query
+            url: "{{ kv('opendental_jdbc_url') }}"
+            username: "{{ kv('opendental_db_user') }}"
+            password: "{{ secret('OPENDENTAL_DB_PASSWORD') }}"
+            sql: |
+              INSERT INTO dental_automation_log
+                (patient_id, workflow_type, channel, status, metadata_json, created_at)
+              VALUES
+                ({{ trigger.row.PatNum }}, 'claims_followup', 'email', 'notified',
+                 '{"ClaimNum":{{ trigger.row.ClaimNum }}}', NOW())

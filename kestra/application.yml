@@ -1,0 +1,71 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Kestra configuration (v0.19.11 OSS)
+#
+# NOISY-NEIGHBOR DEFENSES:
+# Kestra OSS has NO per-namespace concurrency cap — that's Enterprise only.
+# The primary defense is flow-level `concurrency` blocks injected into every
+# generated flow by app/src/lib/workflow-generator.ts (see
+# KESTRA_FLOW_CONCURRENCY_LIMIT). The settings below provide a secondary
+# global bound on worker/executor pool sizes so that even if flow-level
+# caps are bypassed, no tenant can exhaust the JVM thread pool.
+#
+# MONITORING HOOK:
+# Kestra exposes Prometheus metrics at http://<kestra>:8081/prometheus.
+# Key counters to watch for noisy-neighbor signals:
+#   - kestra_queue_size_count{queue="io.kestra.core.models.executions.Execution"}
+#   - kestra_executor_taskrun_started_count by namespace label
+#   - kestra_worker_job_running_count
+# ─────────────────────────────────────────────────────────────────────────────
+
+micronaut:
+  server:
+    port: 8080
+  # Bound Micronaut executor pools so a runaway tenant can't exhaust the JVM.
+  # Kestra's own worker thread pool is sized via the --worker-thread CLI flag
+  # in docker-compose.yml; these caps apply to the HTTP / scheduled layers.
+  executors:
+    # IO executor handles blocking HTTP calls (Twilio, Resend, OpenDental
+    # webhooks in our workflow actions). Cap keeps a burst of one tenant's
+    # HTTP tasks from starving other tenants.
+    io:
+      type: fixed
+      nThreads: 20
+    # Scheduled tasks (internal housekeeping). Low ceiling is fine.
+    scheduled:
+      type: scheduled
+      core-pool-size: 4
+
+datasources:
+  postgres:
+    url: jdbc:postgresql://postgres:5432/kestra
+    driverClassName: org.postgresql.Driver
+    username: kestra
+    password: ${KESTRA_POSTGRES_PASSWORD:k3stra_dev}
+
+kestra:
+  server:
+    basic-auth:
+      enabled: false
+
+  repository:
+    type: postgres
+
+  storage:
+    type: local
+    local:
+      base-path: /app/storage
+
+  queue:
+    type: postgres
+
+  # JDBC-queue executor pool — this is the thread pool that pulls queued
+  # executions out of Postgres and dispatches them. 0 = default (number of
+  # CPUs). Setting a concrete cap (10) keeps a tenant with thousands of
+  # pending executions from dominating the dispatcher loop and gives
+  # consistent behavior across hosts.
+  jdbc:
+    executor:
+      thread-count: 10
+
+  anonymous-usage-report:
+    enabled: false

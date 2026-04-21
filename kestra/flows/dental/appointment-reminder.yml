@@ -1,0 +1,164 @@
+id: appointment-reminder
+namespace: dental
+description: >
+  Runs every morning. Finds appointments in the next 48 hours that
+  haven't been confirmed. Sends SMS at 48h, email at 24h, final SMS
+  at 2h before the appointment.
+
+labels:
+  workflow-type: appointment-reminder
+
+triggers:
+  - id: morning_check
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "0 7 * * *"
+    timezone: "{{ kv('timezone') }}"
+    conditions:
+      - type: io.kestra.plugin.core.condition.DayWeekCondition
+        dayOfWeek:
+          - MONDAY
+          - TUESDAY
+          - WEDNESDAY
+          - THURSDAY
+          - FRIDAY
+          - SATURDAY
+
+tasks:
+  - id: find_unconfirmed
+    type: io.kestra.plugin.jdbc.mysql.Query
+    url: "{{ kv('opendental_jdbc_url') }}"
+    username: "{{ kv('opendental_db_user') }}"
+    password: "{{ secret('OPENDENTAL_DB_PASSWORD') }}"
+    sql: |
+      SELECT
+        a.AptNum,
+        a.AptDateTime,
+        a.Confirmed,
+        p.PatNum,
+        p.FName,
+        p.LName,
+        p.Email,
+        p.WirelessPhone
+      FROM appointment a
+      JOIN patient p ON p.PatNum = a.PatNum
+      WHERE a.AptDateTime BETWEEN NOW() AND DATE_ADD(NOW(), INTERVAL 48 HOUR)
+        AND a.AptStatus = 1
+        AND p.PatStatus = 0
+      ORDER BY a.AptDateTime ASC
+    fetchType: FETCH
+
+  - id: process_each_patient
+    type: io.kestra.plugin.core.flow.ForEach
+    values: "{{ outputs.find_unconfirmed.rows }}"
+    tasks:
+      - id: check_already_reminded
+        type: io.kestra.plugin.jdbc.mysql.Query
+        url: "{{ kv('opendental_jdbc_url') }}"
+        username: "{{ kv('opendental_db_user') }}"
+        password: "{{ secret('OPENDENTAL_DB_PASSWORD') }}"
+        sql: |
+          SELECT COUNT(*) as cnt
+          FROM dental_automation_log
+          WHERE patient_id = {{ taskrun.value.PatNum }}
+            AND workflow_type = 'appointment_reminder'
+            AND metadata_json LIKE '%"AptNum":{{ taskrun.value.AptNum }}%'
+            AND created_at > DATE_SUB(NOW(), INTERVAL 3 DAY)
+        fetchType: FETCH_ONE
+
+      - id: send_if_new
+        type: io.kestra.plugin.core.flow.If
+        condition: "{{ outputs.check_already_reminded.row.cnt == 0 and taskrun.value.WirelessPhone != null and taskrun.value.WirelessPhone != '' }}"
+        then:
+          # Step 1: SMS at 48h
+          - id: send_48h_sms
+            type: io.kestra.plugin.core.http.Request
+            uri: "https://api.twilio.com/2010-04-01/Accounts/{{ kv('twilio_sid') }}/Messages.json"
+            method: POST
+            headers:
+              Content-Type: application/x-www-form-urlencoded
+            basicAuthUser: "{{ kv('twilio_sid') }}"
+            basicAuthPassword: "{{ secret('TWILIO_AUTH_TOKEN') }}"
+            body: >
+              To={{ taskrun.value.WirelessPhone }}&From={{ kv('twilio_from_number') }}&Body=Hi {{ taskrun.value.FName }}, this is {{ kv('clinic_name') }}. Reminder: you have a dental appointment on {{ taskrun.value.AptDateTime }}. Reply CONFIRM to confirm or call {{ kv('clinic_phone') }} to reschedule.
+
+          - id: log_48h_sms
+            type: io.kestra.plugin.jdbc.mysql.Query
+            url: "{{ kv('opendental_jdbc_url') }}"
+            username: "{{ kv('opendental_db_user') }}"
+            password: "{{ secret('OPENDENTAL_DB_PASSWORD') }}"
+            sql: |
+              INSERT INTO dental_automation_log
+                (patient_id, workflow_type, channel, status, metadata_json, created_at)
+              VALUES
+                ({{ taskrun.value.PatNum }}, 'appointment_reminder', 'sms', 'sent_48h',
+                 '{"AptNum":{{ taskrun.value.AptNum }}}', NOW())
+
+          # Step 2: Wait 24 hours
+          - id: wait_24h
+            type: io.kestra.plugin.core.flow.Pause
+            delay: P1D
+
+          # Step 3: Re-check and send email if still unconfirmed
+          - id: recheck_24h
+            type: io.kestra.plugin.jdbc.mysql.Query
+            url: "{{ kv('opendental_jdbc_url') }}"
+            username: "{{ kv('opendental_db_user') }}"
+            password: "{{ secret('OPENDENTAL_DB_PASSWORD') }}"
+            sql: |
+              SELECT a.Confirmed, a.AptStatus
+              FROM appointment a
+              WHERE a.AptNum = {{ taskrun.value.AptNum }}
+            fetchType: FETCH_ONE
+
+          - id: email_if_unconfirmed
+            type: io.kestra.plugin.core.flow.If
+            condition: "{{ outputs.recheck_24h.row.AptStatus == 1 and taskrun.value.Email != null and taskrun.value.Email != '' }}"
+            then:
+              - id: send_24h_email
+                type: io.kestra.plugin.notifications.mail.MailSend
+                host: "{{ kv('smtp_host') }}"
+                port: "{{ kv('smtp_port') }}"
+                username: "{{ kv('smtp_username') }}"
+                password: "{{ secret('SMTP_PASSWORD') }}"
+                from: "{{ kv('smtp_from') }}"
+                to:
+                  - "{{ taskrun.value.Email }}"
+                subject: "Appointment reminder - {{ kv('clinic_name') }}"
+                htmlTextContent: |
+                  <h2>Hi {{ taskrun.value.FName }},</h2>
+                  <p>Friendly reminder that you have a dental appointment
+                  at <strong>{{ kv('clinic_name') }}</strong> tomorrow.</p>
+                  <p>Please call <strong>{{ kv('clinic_phone') }}</strong> if you need
+                  to reschedule.</p>
+
+              # Step 4: Wait until ~2h before appointment
+              - id: wait_until_2h_before
+                type: io.kestra.plugin.core.flow.Pause
+                delay: PT22H
+
+              # Step 5: Final SMS
+              - id: recheck_final
+                type: io.kestra.plugin.jdbc.mysql.Query
+                url: "{{ kv('opendental_jdbc_url') }}"
+                username: "{{ kv('opendental_db_user') }}"
+                password: "{{ secret('OPENDENTAL_DB_PASSWORD') }}"
+                sql: |
+                  SELECT a.Confirmed, a.AptStatus
+                  FROM appointment a
+                  WHERE a.AptNum = {{ taskrun.value.AptNum }}
+                fetchType: FETCH_ONE
+
+              - id: send_final_sms
+                type: io.kestra.plugin.core.flow.If
+                condition: "{{ outputs.recheck_final.row.AptStatus == 1 }}"
+                then:
+                  - id: final_sms
+                    type: io.kestra.plugin.core.http.Request
+                    uri: "https://api.twilio.com/2010-04-01/Accounts/{{ kv('twilio_sid') }}/Messages.json"
+                    method: POST
+                    headers:
+                      Content-Type: application/x-www-form-urlencoded
+                    basicAuthUser: "{{ kv('twilio_sid') }}"
+                    basicAuthPassword: "{{ secret('TWILIO_AUTH_TOKEN') }}"
+                    body: >
+                      To={{ taskrun.value.WirelessPhone }}&From={{ kv('twilio_from_number') }}&Body=Hi {{ taskrun.value.FName }}, just a final reminder: your appointment at {{ kv('clinic_name') }} is coming up shortly today. See you soon!

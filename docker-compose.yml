@@ -1,0 +1,91 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: automation-postgres
+    environment:
+      POSTGRES_DB: kestra
+      POSTGRES_USER: kestra
+      POSTGRES_PASSWORD: ${KESTRA_POSTGRES_PASSWORD:-k3stra_dev}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U kestra"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  kestra:
+    image: kestra/kestra:v0.19.11
+    container_name: automation-kestra
+    pull_policy: always
+    user: root
+    entrypoint: /bin/bash
+    command:
+      - -c
+      # Worker threads cap for the Kestra executor pool. 20 is a reasonable
+      # ceiling for a dev/small-prod setup; paired with flow-level concurrency
+      # limits (set per-flow by app/src/lib/workflow-generator.ts via
+      # KESTRA_FLOW_CONCURRENCY_LIMIT) to prevent any single tenant from
+      # hogging the executor. Bump this only if global throughput is the
+      # bottleneck across all tenants.
+      - /app/kestra server standalone --worker-thread=20
+    volumes:
+      - ./kestra/application.yml:/app/confs/application.yml:ro
+      - kestra-data:/app/storage
+      - kestra-plugins:/app/plugins
+    ports:
+      - "8082:8080"
+      - "8083:8081"
+    environment:
+      MICRONAUT_CONFIG_FILES: /app/confs/application.yml
+    env_file:
+      - .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8080/api/v1/flows/search || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 30s
+
+  mock-opendental:
+    build: ./mock-opendental
+    container_name: automation-mock-opendental
+    ports:
+      - "4000:4000"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:4000/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  app:
+    build: ./app
+    container_name: automation-app
+    ports:
+      - "3002:3000"
+    environment:
+      DATABASE_URL: postgresql://kestra:${KESTRA_POSTGRES_PASSWORD:-k3stra_dev}@postgres:5432/kestra
+      KESTRA_API_URL: http://kestra:8080
+      ANYTHINGLLM_URL: http://host.gateway.internal:3001
+      ANYTHINGLLM_API_KEY: ${ANYTHINGLLM_API_KEY:-playbook-dev-key}
+      PULSAR_JWT_SECRET: ${PULSAR_JWT_SECRET:-dev-secret-change-me-please-32bytes-minimum-abcdefgh}
+      PULSAR_APP_URL: ${PULSAR_APP_URL:-http://localhost:5173}
+      PUBLIC_APP_URL: ${PUBLIC_APP_URL:-http://localhost:3002}
+      NEXT_PUBLIC_PULSAR_APP_URL: ${PULSAR_APP_URL:-http://localhost:5173}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kestra:
+        condition: service_healthy
+    extra_hosts:
+      - "host.gateway.internal:host-gateway"
+
+volumes:
+  postgres-data:
+  kestra-data:
+  kestra-plugins:

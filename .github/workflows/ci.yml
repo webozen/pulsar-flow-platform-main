@@ -1,0 +1,73 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate YAML syntax
+        run: |
+          pip install pyyaml --quiet
+          for f in kestra/flows/**/*.yml kestra/namespace-configs/*.yml kestra/application.yml; do
+            echo "Validating $f..."
+            python3 -c "import yaml; yaml.safe_load(open('$f'))" || exit 1
+          done
+          echo "All YAML files valid."
+
+      - name: Validate Docker Compose
+        run: docker compose config --quiet
+
+  smoke-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: validate
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Create .env
+        run: cp .env.example .env
+
+      - name: Start stack
+        run: docker compose up -d
+
+      - name: Wait for Kestra
+        run: |
+          for i in $(seq 1 60); do
+            curl -sf http://localhost:8080/api/v1/flows >/dev/null 2>&1 && break
+            sleep 2
+          done
+          curl -sf http://localhost:8080/api/v1/flows >/dev/null 2>&1 || \
+            { echo "Kestra did not start"; docker compose logs kestra; exit 1; }
+
+      - name: Load flows
+        run: |
+          for f in kestra/flows/dental/*.yml; do
+            echo "Loading $f..."
+            curl -sf -X POST http://localhost:8080/api/v1/flows \
+              -H "Content-Type: application/x-yaml" \
+              --data-binary @"$f" || echo "WARNING: failed to load $f"
+          done
+
+      - name: Verify flow count
+        run: |
+          count=$(curl -sf http://localhost:8080/api/v1/flows/dental | python3 -c "import sys,json; print(len(json.load(sys.stdin)))")
+          echo "Loaded $count flows"
+          [ "$count" -ge 4 ] || { echo "Expected at least 4 flows"; exit 1; }
+
+      - name: Cleanup
+        if: always()
+        run: docker compose down -v

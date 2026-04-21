@@ -1,0 +1,100 @@
+generator client {
+  provider        = "prisma-client-js"
+  previewFeatures = ["multiSchema"]
+}
+
+datasource db {
+  provider = "postgresql"
+  schemas  = ["flowcore"]
+}
+
+enum Role {
+  ADMIN
+  MANAGER
+  STAFF
+
+  @@schema("flowcore")
+}
+
+model User {
+  id            String    @id @default(cuid())
+  name          String?
+  email         String    @unique
+  emailVerified DateTime?
+  password      String?
+  image         String?
+  role          Role      @default(STAFF)
+  clinicId      String?
+  clinic        Clinic?   @relation(fields: [clinicId], references: [id])
+  accounts      Account[]
+  sessions      Session[]
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  @@schema("flowcore")
+}
+
+model Clinic {
+  id               String  @id @default(cuid())
+  name             String
+  slug             String  @unique
+  phone            String?
+  timezone         String  @default("America/New_York")
+  kestraNamespace  String  @unique
+  opendentalHost     String?
+  opendentalPort     Int?     @default(3306)
+  opendentalDatabase String?  @default("opendental")
+  opendentalUser     String?
+  twilioSid        String?
+  twilioFromNumber  String?
+  smtpHost         String?
+  smtpPort         Int?     @default(587)
+  smtpUsername      String?
+  smtpFrom         String?
+  billingEmail     String?
+  frontDeskEmail   String?
+  isActive         Boolean  @default(true)
+  users            User[]
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  @@schema("flowcore")
+}
+
+model Account {
+  id                String  @id @default(cuid())
+  userId            String
+  type              String
+  provider          String
+  providerAccountId String
+  refresh_token     String?
+  access_token      String?
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String?
+  session_state     String?
+  user              User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+  @@schema("flowcore")
+}
+
+model Session {
+  id           String   @id @default(cuid())
+  sessionToken String   @unique
+  userId       String
+  expires      DateTime
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@schema("flowcore")
+}
+
+model VerificationToken {
+  identifier String
+  token      String   @unique
+  expires    DateTime
+
+  @@unique([identifier, token])
+  @@schema("flowcore")
+}

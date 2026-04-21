@@ -1,0 +1,31 @@
+# Clinic B configuration
+# Applied to namespace dental.clinic-b via scripts/add-clinic.sh
+namespace: dental.clinic-b
+
+variables:
+  clinic_name: "Downtown Family Dentistry"
+  clinic_phone: "(212) 555-5678"
+  timezone: "America/New_York"
+
+  # Twilio SMS
+  twilio_sid: "ACyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy"
+  twilio_from_number: "+12125555678"
+
+  # SMTP / Email
+  smtp_host: "smtp.gmail.com"
+  smtp_port: "587"
+  smtp_username: "reminders@downtownfamilydentistry.com"
+  smtp_from: "reminders@downtownfamilydentistry.com"
+
+  # Open Dental MySQL (read-only connection)
+  opendental_jdbc_url: "jdbc:mysql://10.0.2.30:3306/opendental"
+  opendental_db_user: "kestra_readonly"
+
+  # Internal routing
+  billing_team_email: "billing@downtownfamilydentistry.com"
+  front_desk_email: "frontdesk@downtownfamilydentistry.com"
+
+# Secrets — set via Kestra API, NOT stored here
+#   OPENDENTAL_DB_PASSWORD
+#   TWILIO_AUTH_TOKEN
+#   SMTP_PASSWORD

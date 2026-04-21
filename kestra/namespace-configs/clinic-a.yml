@@ -1,0 +1,32 @@
+# Clinic A configuration
+# Applied to namespace dental.clinic-a via scripts/add-clinic.sh
+namespace: dental.clinic-a
+
+variables:
+  clinic_name: "Smile Dental Care"
+  clinic_phone: "(415) 555-1234"
+  timezone: "America/Los_Angeles"
+
+  # Twilio SMS
+  twilio_sid: "ACxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+  twilio_from_number: "+14155551234"
+
+  # SMTP / Email
+  smtp_host: "smtp.gmail.com"
+  smtp_port: "587"
+  smtp_username: "reminders@smiledentalcare.com"
+  smtp_from: "reminders@smiledentalcare.com"
+
+  # Open Dental MySQL (read-only connection)
+  opendental_jdbc_url: "jdbc:mysql://10.0.1.50:3306/opendental"
+  opendental_db_user: "kestra_readonly"
+
+  # Internal routing
+  billing_team_email: "billing@smiledentalcare.com"
+  front_desk_email: "frontdesk@smiledentalcare.com"
+
+# Secrets — set via Kestra API, NOT stored here
+# scripts/add-clinic.sh will prompt for these:
+#   OPENDENTAL_DB_PASSWORD
+#   TWILIO_AUTH_TOKEN
+#   SMTP_PASSWORD
