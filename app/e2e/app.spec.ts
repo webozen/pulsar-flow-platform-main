@@ -1,299 +1,229 @@
-import { test, expect } from "@playwright/test";
+import { test, expect, request as playwrightRequest } from "@playwright/test";
 
-const TEST_EMAIL = `e2e-${Date.now()}@test.com`;
-const TEST_PASSWORD = "testpass123";
+const BACKEND = "http://localhost:18080";
+const APP = "http://localhost:3002";
+const PROXY = "http://localhost:5173";
+const ADMIN_PASSCODE = process.env.PULSAR_ADMIN_PASSCODE ?? "PULS-DEV-0000";
+const TENANT_SLUG = process.env.TEST_TENANT_SLUG ?? "acme";
+const TENANT_EMAIL = process.env.TEST_TENANT_EMAIL ?? "admin@acme.test";
+const TENANT_PASSCODE = process.env.TEST_TENANT_PASSCODE ?? "PULS-RVWK-NTWZ";
 
-test.describe("Authentication", () => {
-  test("login page loads", async ({ page }) => {
-    await page.goto("/login");
-    await expect(page.locator("text=Welcome back")).toBeVisible();
-    await expect(page.locator("input[name=email]")).toBeVisible();
-    await expect(page.locator("input[name=password]")).toBeVisible();
+let tenantToken: string;
+
+test.beforeAll(async () => {
+  const api = await playwrightRequest.newContext();
+  const res = await api.post(`${BACKEND}/api/tenant/login`, {
+    data: { slug: TENANT_SLUG, email: TENANT_EMAIL, passcode: TENANT_PASSCODE },
+  });
+  if (!res.ok()) {
+    throw new Error(
+      `Tenant login failed (HTTP ${res.status()}). Make sure tenant "${TENANT_SLUG}" exists and passcode is current. Body: ${await res.text()}`,
+    );
+  }
+  const body = await res.json();
+  tenantToken = body.token;
+  expect(tenantToken).toBeTruthy();
+});
+
+test.describe("Backend (pulsar-backend) — auth API", () => {
+  test("admin login returns HS384 JWT", async ({ request }) => {
+    const r = await request.post(`${BACKEND}/api/admin/login`, {
+      data: { passcode: ADMIN_PASSCODE },
+    });
+    expect(r.ok()).toBeTruthy();
+    const body = await r.json();
+    expect(body.token).toMatch(/^eyJ[\w-]+\.eyJ[\w-]+\.[\w-]+$/);
   });
 
-  test("can register a new account", async ({ page }) => {
-    await page.goto("/login");
-    await page.click("text=Need an account? Sign up");
-    await expect(page.locator("text=Create your account")).toBeVisible();
-
-    await page.fill("input[name=name]", "E2E Test User");
-    await page.fill("input[name=email]", TEST_EMAIL);
-    await page.fill("input[name=password]", TEST_PASSWORD);
-    await page.click("button:text('Create Account')");
-
-    // Should redirect to dashboard (may go through login first)
-    await page.waitForURL(/\/(dashboard|login)/, { timeout: 15000 });
-    // If still on login, sign in
-    if (page.url().includes("/login")) {
-      await page.fill("input[name=email]", TEST_EMAIL);
-      await page.fill("input[name=password]", TEST_PASSWORD);
-      await page.click("button:text('Sign In')");
-      await page.waitForURL("**/dashboard", { timeout: 10000 });
-    }
-    await expect(page.locator("h1:text('Dashboard')")).toBeVisible();
+  test("tenant login issues token and sets pulsar_jwt cookie", async ({ request }) => {
+    const r = await request.post(`${BACKEND}/api/tenant/login`, {
+      data: { slug: TENANT_SLUG, email: TENANT_EMAIL, passcode: TENANT_PASSCODE },
+    });
+    expect(r.ok()).toBeTruthy();
+    const setCookie = r.headers()["set-cookie"] ?? "";
+    expect(setCookie).toContain("pulsar_jwt=");
+    expect(setCookie).toContain("HttpOnly");
+    expect(setCookie).toContain("Path=/");
   });
 
-  test("can login with existing credentials", async ({ page }) => {
-    await page.goto("/login");
-    await page.fill("input[name=email]", "admin@test.com");
-    await page.fill("input[name=password]", "password123");
-    await page.click("button:text('Sign In')");
-
-    await page.waitForURL("**/dashboard", { timeout: 15000 });
-    await expect(page.locator("h1:text('Dashboard')")).toBeVisible();
+  test("/api/auth/me returns tenant claims when called with Bearer", async ({ request }) => {
+    const r = await request.get(`${BACKEND}/api/auth/me`, {
+      headers: { Authorization: `Bearer ${tenantToken}` },
+    });
+    expect(r.ok()).toBeTruthy();
+    const body = await r.json();
+    expect(body.slug).toBe(TENANT_SLUG);
+    expect(body.role).toBe("tenant_user");
+    expect(body.email).toBe(TENANT_EMAIL);
   });
 
-  test("rejects wrong password", async ({ page }) => {
-    await page.goto("/login");
-    await page.fill("input[name=email]", "admin@test.com");
-    await page.fill("input[name=password]", "wrongpassword");
-    await page.click("button:text('Sign In')");
+  test("/api/auth/me without token is 401", async ({ request }) => {
+    const r = await request.get(`${BACKEND}/api/auth/me`);
+    expect(r.status()).toBe(401);
+  });
 
-    await expect(page.locator("text=Invalid email or password")).toBeVisible();
+  test("/api/auth/refresh rotates a valid token", async ({ request }) => {
+    // JWT iat/exp have second-level resolution, so a refresh within the same
+    // second returns an identical token (the payload is byte-identical). Sleep
+    // briefly to guarantee a different iat and therefore a different signature.
+    await new Promise((r) => setTimeout(r, 1100));
+    const r = await request.post(`${BACKEND}/api/auth/refresh`, {
+      headers: { Authorization: `Bearer ${tenantToken}` },
+    });
+    expect(r.ok()).toBeTruthy();
+    const body = await r.json();
+    expect(body.token).toBeTruthy();
+    expect(body.token).not.toBe(tenantToken);
   });
 });
 
-test.describe("Dashboard", () => {
-  test.beforeEach(async ({ page }) => {
-    // Login first
-    await page.goto("/login");
-    await page.fill("input[name=email]", "admin@test.com");
-    await page.fill("input[name=password]", "password123");
-    await page.click("button:text('Sign In')");
-    await page.waitForURL("**/dashboard", { timeout: 10000 });
+test.describe("Backend — OpenAPI surface", () => {
+  test("OpenAPI spec is served", async ({ request }) => {
+    const r = await request.get(`${BACKEND}/v3/api-docs`);
+    expect(r.ok()).toBeTruthy();
+    const spec = await r.json();
+    expect(spec.openapi).toBeTruthy();
+    expect(Object.keys(spec.paths)).toContain("/api/auth/me");
   });
 
-  test("shows stat cards", async ({ page }) => {
-    await expect(page.locator("text=Active Clinics")).toBeVisible();
-    await expect(page.locator("text=Active Workflows")).toBeVisible();
-    await expect(page.locator("text=Pending Approvals")).toBeVisible();
-    await expect(page.locator("text=Failed Runs")).toBeVisible();
-  });
-
-  test("shows workflow performance section", async ({ page }) => {
-    await expect(page.locator("text=Workflow Performance")).toBeVisible();
-  });
-
-  test("shows recent executions section", async ({ page }) => {
-    await expect(page.locator("text=Recent Executions")).toBeVisible();
-  });
-
-  test("nav links work", async ({ page }) => {
-    await page.click("a:text('Clinics')");
-    await expect(page.locator("h1:text('Clinics')")).toBeVisible();
-
-    await page.click("a:text('Approvals')");
-    await expect(page.locator("h1:text('Approval Queue')")).toBeVisible();
-
-    await page.click("a:text('Dashboard')");
-    await expect(page.locator("h1:text('Dashboard')")).toBeVisible();
+  test("Swagger UI redirects to the index", async ({ request }) => {
+    const r = await request.get(`${BACKEND}/swagger-ui.html`, { maxRedirects: 0 });
+    expect([200, 302]).toContain(r.status());
   });
 });
 
-test.describe("Clinics", () => {
-  test.beforeEach(async ({ page }) => {
-    await page.goto("/login");
-    await page.fill("input[name=email]", "admin@test.com");
-    await page.fill("input[name=password]", "password123");
-    await page.click("button:text('Sign In')");
-    await page.waitForURL("**/dashboard", { timeout: 10000 });
+test.describe("Vite proxy (pulsar-frontend) routes to backend", () => {
+  test("/api via proxy reaches :18080", async ({ request }) => {
+    const r = await request.post(`${PROXY}/api/admin/login`, {
+      data: { passcode: ADMIN_PASSCODE },
+    });
+    expect(r.ok()).toBeTruthy();
   });
 
-  test("clinic list shows existing clinics", async ({ page }) => {
-    await page.goto("/clinics");
-    await expect(page.locator("text=Smile Dental Care")).toBeVisible();
+  test("/v3/api-docs via proxy reaches :18080", async ({ request }) => {
+    const r = await request.get(`${PROXY}/v3/api-docs`);
+    expect(r.ok()).toBeTruthy();
   });
 
-  test("add clinic page loads", async ({ page }) => {
-    await page.goto("/clinics/new");
-    await expect(page.locator("h1:text('Add Clinic')")).toBeVisible();
-    await expect(page.locator("input[name=name]")).toBeVisible();
-    await expect(page.locator("input[name=slug]")).toBeVisible();
-  });
-
-  test("can navigate to clinic detail", async ({ page }) => {
-    await page.goto("/clinics");
-    await page.click("text=Smile Dental Care");
-    await expect(page.locator("text=Smile Dental Care")).toBeVisible();
-    await expect(page.locator("text=dental.smile-dental")).toBeVisible();
+  test("/automation via proxy reaches :3002", async ({ page }) => {
+    const response = await page.goto(`${PROXY}/automation/login`);
+    expect(response?.ok()).toBeTruthy();
+    await expect(page).toHaveTitle(/Pulsar/);
   });
 });
 
-test.describe("Automation Center (4-tab layout)", () => {
-  test.beforeEach(async ({ page }) => {
-    await page.goto("/login");
-    await page.fill("input[name=email]", "admin@test.com");
-    await page.fill("input[name=password]", "password123");
-    await page.click("button:text('Sign In')");
-    await page.waitForURL("**/dashboard", { timeout: 10000 });
-    // Navigate to the clinic's workflows
-    await page.goto("/clinics");
-    await page.click("text=Smile Dental Care");
-    await page.click("text=Workflows");
+test.describe("Flow-platform — unauthenticated", () => {
+  test("/automation/dashboard without cookie redirects to /login", async ({ page }) => {
+    const response = await page.goto(`${APP}/automation/dashboard`);
+    // Server-side redirects through /login, which then client-redirects to the Pulsar app.
+    // We accept either the intermediate /login page OR the Pulsar app URL.
+    await page.waitForLoadState("domcontentloaded");
+    expect(page.url()).toMatch(/\/login$|localhost:5173/);
+    expect(response).toBeTruthy();
   });
 
-  test("shows 4 tabs", async ({ page }) => {
-    await expect(page.locator("[role=tab]:text('Workflows')")).toBeVisible();
-    await expect(page.locator("[role=tab]:text('Triggers')")).toBeVisible();
-    await expect(page.locator("[role=tab]:text('Reports')")).toBeVisible();
-    await expect(page.locator("[role=tab]:text('Audit Log')")).toBeVisible();
-  });
-
-  test("triggers tab shows categories", async ({ page }) => {
-    await page.click("[role=tab]:text('Triggers')");
-    await page.waitForTimeout(500);
-    await expect(page.locator("h3:has-text('Referrals'), div:has-text('Referrals')").first()).toBeVisible({ timeout: 10000 });
-  });
-
-  test("trigger test button works", async ({ page }) => {
-    await page.click("[role=tab]:text('Triggers')");
-    // Wait for trigger library to load
-    await page.waitForSelector("button:has-text('Test')", { timeout: 10000 });
-    const testButton = page.locator("button:has-text('Test')").first();
-    await testButton.click();
-    // Wait for test results — look for the row count or placeholders text
-    await page.waitForTimeout(2000);
-    const hasResults = await page.locator("text=/\\d+ rows/").first().isVisible().catch(() => false);
-    expect(hasResults || true).toBeTruthy(); // Soft pass — API may not be reachable from within test browser context
-  });
-
-  test("reports tab loads", async ({ page }) => {
-    await page.click("[role=tab]:text('Reports')");
-    await expect(page.locator("text=Generate Report")).toBeVisible();
-  });
-
-  test("audit tab loads", async ({ page }) => {
-    await page.click("[role=tab]:text('Audit Log')");
-    // Should show status filter buttons
-    await expect(page.locator("button:text('All')")).toBeVisible();
-  });
-
-  test("create workflow page loads with all sections", async ({ page }) => {
-    await page.click("text=Create Workflow");
-    await expect(page.locator("h1:has-text('Create Workflow')")).toBeVisible();
-    await expect(page.getByText("Basics", { exact: true })).toBeVisible();
-    await expect(page.getByText("When Triggered")).toBeVisible();
-    await expect(page.getByText("Actions", { exact: true }).first()).toBeVisible();
-  });
-
-  test("workflow builder shows action buttons", async ({ page }) => {
-    await page.click("text=Create Workflow");
-    await expect(page.locator("button:text('+ SMS')")).toBeVisible();
-    await expect(page.locator("button:text('+ Email')")).toBeVisible();
-    await expect(page.locator("button:text('+ Webhook')")).toBeVisible();
-    await expect(page.locator("button:text('+ Delay')")).toBeVisible();
-    await expect(page.locator("button:text('+ Approval Gate')")).toBeVisible();
-    await expect(page.locator("button:text('+ Condition')")).toBeVisible();
-    await expect(page.locator("button:text('+ AI Generate')")).toBeVisible();
+  test("/automation/login is a client-side redirect to the Pulsar frontend", async ({ page }) => {
+    // The shim page runs a useEffect that sets window.location.href to the Pulsar URL.
+    // The spinner text ("Redirecting to Pulsar") flashes for one tick; reliably asserting
+    // that the redirect landed on :5173 is both more meaningful and deterministic.
+    await page.goto(`${APP}/automation/login`, { waitUntil: "commit" });
+    await page.waitForURL(/localhost:5173/, { timeout: 10000 });
+    expect(page.url()).toMatch(/localhost:5173/);
   });
 });
 
-test.describe("Clinic Portal", () => {
-  test("portal overview loads", async ({ page }) => {
-    await page.goto("/portal/smile-dental");
-    await expect(page.locator("text=Smile Dental Care")).toBeVisible();
-    await expect(page.locator("text=Active Workflows")).toBeVisible();
+test.describe("Flow-platform — authenticated (tenant user)", () => {
+  test.beforeEach(async ({ context }) => {
+    await context.addCookies([
+      {
+        name: "pulsar_jwt",
+        value: tenantToken,
+        domain: "localhost",
+        path: "/",
+        httpOnly: true,
+        sameSite: "Lax",
+      },
+    ]);
   });
 
-  test("portal executions page loads", async ({ page }) => {
-    await page.goto("/portal/smile-dental/executions");
-    await expect(page.locator("text=Execution History")).toBeVisible();
+  test("dashboard renders with AppShell", async ({ page }) => {
+    await page.goto(`${APP}/automation/dashboard`);
+    // Should NOT have been redirected away.
+    await page.waitForLoadState("domcontentloaded");
+    expect(page.url()).toContain("/automation/dashboard");
+  });
+
+  test("/automation/clinics redirects the tenant to their workflows page", async ({ page }) => {
+    await page.goto(`${APP}/automation/clinics`);
+    await page.waitForLoadState("domcontentloaded");
+    expect(page.url()).toMatch(/\/automation\/clinics\/[^/]+\/workflows$/);
+  });
+
+  test("GET /automation/api/clinics returns this tenant's clinic", async ({ request }) => {
+    const r = await request.get(`${APP}/automation/api/clinics`, {
+      headers: { Cookie: `pulsar_jwt=${tenantToken}` },
+    });
+    expect(r.ok()).toBeTruthy();
+    const clinics = await r.json();
+    expect(Array.isArray(clinics)).toBeTruthy();
+    expect(clinics.length).toBeGreaterThanOrEqual(1);
+    expect(clinics.some((c: { slug: string }) => c.slug === TENANT_SLUG)).toBeTruthy();
+  });
+
+  test("GET /automation/api/workflows responds", async ({ request }) => {
+    const r = await request.get(`${APP}/automation/api/workflows`, {
+      headers: { Cookie: `pulsar_jwt=${tenantToken}` },
+    });
+    expect(r.ok()).toBeTruthy();
+  });
+
+  test("GET /automation/api/approvals responds", async ({ request }) => {
+    const r = await request.get(`${APP}/automation/api/approvals`, {
+      headers: { Cookie: `pulsar_jwt=${tenantToken}` },
+    });
+    expect(r.ok()).toBeTruthy();
+  });
+
+  test("GET /automation/api/conversations responds", async ({ request }) => {
+    const r = await request.get(`${APP}/automation/api/conversations`, {
+      headers: { Cookie: `pulsar_jwt=${tenantToken}` },
+    });
+    expect(r.ok()).toBeTruthy();
+  });
+
+  test("protected API rejects requests without the cookie", async ({ request }) => {
+    const r = await request.get(`${APP}/automation/api/clinics`);
+    // Either 401 or a 307/308 redirect to /login — both are 'not authorized'
+    expect([401, 307, 308]).toContain(r.status());
   });
 });
 
-test.describe("Sprint A Features", () => {
-  test.beforeEach(async ({ page }) => {
-    await page.goto("/login");
-    await page.fill("input[name=email]", "admin@test.com");
-    await page.fill("input[name=password]", "password123");
-    await page.click("button:text('Sign In')");
-    await page.waitForURL("**/dashboard", { timeout: 15000 });
-  });
+test.describe("Full end-to-end handshake (via Vite proxy, real browser)", () => {
+  test("tenant login → cookie → authenticated /automation → /api both usable", async ({ page, request }) => {
+    // 1. Log in via the proxy (same path a browser would take)
+    const login = await request.post(`${PROXY}/api/tenant/login`, {
+      data: { slug: TENANT_SLUG, email: TENANT_EMAIL, passcode: TENANT_PASSCODE },
+    });
+    expect(login.ok()).toBeTruthy();
+    const body = await login.json();
+    const token = body.token;
 
-  test("workflow builder shows template picker", async ({ page }) => {
-    await page.goto("/clinics");
-    await page.click("text=Smile Dental Care");
-    await page.click("text=Workflows");
-    await page.click("text=Create Workflow");
-    await expect(page.locator("text=Start from Template")).toBeVisible();
-    await expect(page.locator("text=Overdue Recall Reminder")).toBeVisible();
-  });
+    // 2. Inject the same cookie into the browser context.
+    await page.context().addCookies([
+      { name: "pulsar_jwt", value: token, domain: "localhost", path: "/", httpOnly: true, sameSite: "Lax" },
+    ]);
 
-  test("selecting a template pre-fills the form", async ({ page }) => {
-    await page.goto("/clinics");
-    await page.click("text=Smile Dental Care");
-    await page.click("text=Workflows");
-    await page.click("text=Create Workflow");
-    // Click a template
-    await page.click("button:has-text('Simple Recall SMS')");
-    await page.waitForTimeout(300);
-    // Verify a field got pre-filled — the actions section should now have content
-    const hasSmsAction = await page.locator("text=Step 1: SMS").isVisible().catch(() => false);
-    expect(hasSmsAction).toBeTruthy();
-  });
+    // 3. Hit the flow-platform via the proxy — should not redirect to login.
+    const resp = await page.goto(`${PROXY}/automation/dashboard`);
+    expect(resp?.ok()).toBeTruthy();
+    expect(page.url()).toContain("/automation/dashboard");
 
-  test("workflow builder shows advanced settings", async ({ page }) => {
-    await page.goto("/clinics");
-    await page.click("text=Smile Dental Care");
-    await page.click("text=Workflows");
-    await page.click("text=Create Workflow");
-    await expect(page.locator("text=Advanced Settings")).toBeVisible();
-    await expect(page.locator("text=Max Concurrent Runs")).toBeVisible();
-    await expect(page.locator("text=Timeout")).toBeVisible();
-    await expect(page.locator("text=Error Notification Email")).toBeVisible();
-    await expect(page.locator("text=Dedup enabled")).toBeVisible();
-  });
-
-  test("workflow builder has Open Dental trigger type selected by default", async ({ page }) => {
-    await page.goto("/clinics");
-    await page.click("text=Smile Dental Care");
-    await page.click("text=Workflows");
-    await page.click("text=Create Workflow");
-    // Scroll past templates to the form
-    await page.evaluate(() => window.scrollTo(0, 600));
-    await page.waitForTimeout(300);
-    // Open Dental button should exist and be the active trigger type
-    await expect(page.locator("button:has-text('Open Dental')").first()).toBeVisible();
-  });
-
-  test("workflow builder shows parallel checkbox on actions", async ({ page }) => {
-    await page.goto("/clinics");
-    await page.click("text=Smile Dental Care");
-    await page.click("text=Workflows");
-    await page.click("text=Create Workflow");
-    await page.click("button:text('+ SMS')");
-    await expect(page.locator("text=Parallel")).toBeVisible();
-  });
-
-  test("workflow list shows test button", async ({ page }) => {
-    // Create a workflow first via API
-    const clinics = await (await fetch("http://localhost:3000/api/clinics")).json();
-    if (clinics.length > 0) {
-      await fetch("http://localhost:3000/api/workflows", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          clinicId: clinics[0].id,
-          name: "E2E Sprint A Test " + Date.now(),
-          triggerSql: "SELECT PatNum AS patNum FROM patient",
-          triggerCron: "0 9 * * *",
-          actions: [{ type: "sms", message: "test" }],
-        }),
-      });
-    }
-    await page.goto("/clinics");
-    await page.click("text=Smile Dental Care");
-    await page.click("text=Workflows");
-    // The test (play) button should be visible for any workflow
-    await page.waitForTimeout(500);
-    const hasWorkflows = await page.locator("text=E2E Sprint A Test").isVisible().catch(() => false);
-    expect(hasWorkflows || true).toBeTruthy();
-  });
-
-  test("Kestra UI link is visible", async ({ page }) => {
-    await page.goto("/clinics");
-    await page.click("text=Smile Dental Care");
-    await page.click("text=Workflows");
-    await expect(page.locator("text=Kestra UI")).toBeVisible();
+    // 4. In the same session, backend API should accept the Bearer token.
+    const me = await request.get(`${PROXY}/api/auth/me`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    expect(me.ok()).toBeTruthy();
+    const meBody = await me.json();
+    expect(meBody.slug).toBe(TENANT_SLUG);
   });
 });

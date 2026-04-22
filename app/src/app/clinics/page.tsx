@@ -10,11 +10,16 @@ export default async function ClinicsPage() {
   const token = cookieStore.get('pulsar_jwt')?.value
   if (!token) redirect('/login')
 
+  let clinicId: string
   try {
     const { slug } = validateToken(token)
     const clinic = await getOrCreateClinic(slug)
-    redirect(`/clinics/${clinic.id}/workflows`)
+    clinicId = clinic.id
   } catch {
     redirect('/login')
   }
+  // Must live OUTSIDE the try/catch. Next's `redirect()` is implemented by
+  // throwing a NEXT_REDIRECT sentinel error; the surrounding catch would
+  // swallow it and send the user to /login on every successful hit.
+  redirect(`/clinics/${clinicId}/workflows`)
 }
