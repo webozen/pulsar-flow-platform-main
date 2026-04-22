@@ -95,6 +95,65 @@ test.describe("Bug #9 — TenantDto no longer leaks passcode", () => {
   });
 });
 
+test.describe("Passcode hashing at rest", () => {
+  test("DB column stores a BCrypt hash, not the plaintext passcode", async () => {
+    const { execSync } = await import("node:child_process");
+    const out = execSync(
+      `"C:\\Apps\\mysql-8.4\\bin\\mysql.exe" -uroot -ppulsar -h 127.0.0.1 -P 3316 pulsar_platform -sN ` +
+        `-e "SELECT access_passcode_hash FROM public_tenants WHERE slug='${TENANT_SLUG}'"`,
+      { encoding: "utf8" },
+    );
+    expect(out.trim()).toMatch(/^\$2[aby]\$\d{2}\$/);
+  });
+
+  test("login still verifies correctly even though DB stores only a hash", async ({ request }) => {
+    const r = await request.post(`${BACKEND}/api/tenant/login`, {
+      data: { slug: TENANT_SLUG, email: TENANT_EMAIL, passcode: TENANT_PASSCODE },
+    });
+    expect(r.ok()).toBeTruthy();
+  });
+});
+
+test.describe("Logout endpoint", () => {
+  test("POST /api/auth/logout clears the pulsar_jwt cookie", async ({ request }) => {
+    // Log in first so the client has a cookie to clear.
+    const login = await request.post(`${BACKEND}/api/tenant/login`, {
+      data: { slug: TENANT_SLUG, email: TENANT_EMAIL, passcode: TENANT_PASSCODE },
+    });
+    expect(login.ok()).toBeTruthy();
+
+    const logout = await request.post(`${BACKEND}/api/auth/logout`);
+    expect(logout.ok()).toBeTruthy();
+    const setCookie = logout.headers()["set-cookie"] ?? "";
+    expect(setCookie).toContain("pulsar_jwt=");
+    // Max-Age=0 is how RFC 6265 says "delete immediately"
+    expect(setCookie).toMatch(/Max-Age=0/i);
+  });
+});
+
+test.describe("Tenant login now verifies email as a third factor", () => {
+  test("wrong email with right passcode is rejected (401)", async ({ request }) => {
+    const r = await request.post(`${BACKEND}/api/tenant/login`, {
+      data: { slug: TENANT_SLUG, email: "intruder@evil.test", passcode: TENANT_PASSCODE },
+    });
+    expect(r.status()).toBe(401);
+  });
+
+  test("correct email in uppercase still works (case-insensitive)", async ({ request }) => {
+    const r = await request.post(`${BACKEND}/api/tenant/login`, {
+      data: { slug: TENANT_SLUG, email: TENANT_EMAIL.toUpperCase(), passcode: TENANT_PASSCODE },
+    });
+    expect(r.ok()).toBeTruthy();
+  });
+
+  test("missing email field rejects (401)", async ({ request }) => {
+    const r = await request.post(`${BACKEND}/api/tenant/login`, {
+      data: { slug: TENANT_SLUG, passcode: TENANT_PASSCODE },
+    });
+    expect([400, 401]).toContain(r.status());
+  });
+});
+
 test.describe("Bug #6 — Redis dependency fully removed", () => {
   test("backend has no Redis client configured and tenant writes succeed without Redis running", async ({ request }) => {
     // With Redis entirely uninstalled, every admin CRUD path must succeed.
