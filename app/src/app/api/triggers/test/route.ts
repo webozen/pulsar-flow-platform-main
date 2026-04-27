@@ -1,6 +1,9 @@
 import { NextResponse } from "next/server";
 import { queryOne, initDb } from "@/lib/db";
 import { extractPlaceholders } from "@/lib/trigger-library";
+import { getKV } from "@/lib/kestra";
+import { OPENDENTAL_BASE } from "@/lib/opendental";
+import { namespaceFor } from "@/lib/tenant-sync";
 
 export const dynamic = "force-dynamic";
 
@@ -28,13 +31,31 @@ export async function POST(req: Request) {
     }
   }
 
-  // Get clinic's Open Dental API config
-  const clinic = await queryOne<{ opendental_api_url: string; opendental_api_key: string }>(
-    "SELECT opendental_api_url, opendental_api_key FROM flowcore.clinics WHERE id = $1",
-    [clinicId]
-  );
-  if (!clinic?.opendental_api_url) {
-    return NextResponse.json({ error: "Clinic has no Open Dental API configured" }, { status: 400 });
+  // Phase 2: per-tenant credentials live in Kestra KV under the
+  // tenant's namespace. The UI passes `clinicId` from the URL params
+  // — under Plan B the URL `[id]` is the slug, not a UUID, but legacy
+  // call sites still pass the UUID `flowcore.clinics.id`. Accept both:
+  // try slug first (covers the URL-param path), fall back to id lookup
+  // (covers any caller that still uses the UUID).
+  let slug: string | null = clinicId;
+  if (!/^[a-z][a-z0-9-]{1,62}$/.test(String(clinicId))) {
+    const row = await queryOne<{ slug: string }>(
+      "SELECT slug FROM flowcore.clinics WHERE id = $1",
+      [clinicId]
+    );
+    slug = row?.slug ?? null;
+  }
+  if (!slug) {
+    return NextResponse.json({ error: "Clinic not found" }, { status: 404 });
+  }
+  const namespace = namespaceFor(slug);
+  const developerKey = await getKV(namespace, "opendental_developer_key");
+  const customerKey  = await getKV(namespace, "opendental_customer_key");
+  if (!developerKey || !customerKey) {
+    return NextResponse.json(
+      { error: "Clinic has no OpenDental credentials configured (set opendental_developer_key + opendental_customer_key in Kestra KV)" },
+      { status: 400 },
+    );
   }
 
   // Add LIMIT 5 if not present
@@ -48,11 +69,11 @@ export async function POST(req: Request) {
   testSql = testSql.replace(/\{\{since\}\}/g, since);
 
   try {
-    const res = await fetch(`${clinic.opendental_api_url}/queries/ShortQuery`, {
+    const res = await fetch(`${OPENDENTAL_BASE}/queries/ShortQuery`, {
       method: "PUT",
       headers: {
         "Content-Type": "application/json",
-        Authorization: `ODFHIR ${clinic.opendental_api_key}`,
+        Authorization: `ODFHIR ${developerKey}/${customerKey}`,
       },
       body: JSON.stringify({ SqlCommand: testSql }),
     });

@@ -1,8 +1,7 @@
 import { NextResponse } from "next/server";
+import { KESTRA_URL } from "@/lib/kestra";
 
 export const dynamic = "force-dynamic";
-
-const KESTRA_URL = process.env.KESTRA_API_URL || "http://localhost:8080";
 
 /**
  * Search for all workflow executions involving a specific patient.

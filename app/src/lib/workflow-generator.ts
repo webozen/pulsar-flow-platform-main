@@ -197,22 +197,22 @@ function actionToYaml(action: WorkflowAction, index: number): string {
     case "create_commlog":
       return `      - id: ${id}_commlog
         type: io.kestra.plugin.core.http.Request
-        uri: "{{ kv('opendental_api_url') }}/commlogs"
+        uri: "https://api.opendental.com/api/v1/commlogs"
         method: POST
         headers:
           Content-Type: application/json
-          Authorization: "ODFHIR {{ kv('opendental_api_key') }}"
+          Authorization: "ODFHIR {{ kv('opendental_developer_key') }}/{{ kv('opendental_customer_key') }}"
         body: |
           {"PatNum":${upgrade(action.patNum) || "{{ inputs.record.patNum }}"},"Note":"${upgrade(action.note).replace(/"/g, '\\"')}"}${retry}`;
 
     case "update_appointment_status":
       return `      - id: ${id}_apt_update
         type: io.kestra.plugin.core.http.Request
-        uri: "{{ kv('opendental_api_url') }}/appointments/${upgrade(action.aptNum) || "{{ inputs.record.aptNum }}"}"
+        uri: "https://api.opendental.com/api/v1/appointments/${upgrade(action.aptNum) || "{{ inputs.record.aptNum }}"}"
         method: PUT
         headers:
           Content-Type: application/json
-          Authorization: "ODFHIR {{ kv('opendental_api_key') }}"
+          Authorization: "ODFHIR {{ kv('opendental_developer_key') }}/{{ kv('opendental_customer_key') }}"
         body: |
           {"Confirmed":"${action.status || "confirmed"}"}${retry}`;
 
@@ -288,6 +288,11 @@ function generateWorkerYaml(def: WorkflowDef): string {
     `  worker: "true"`,
   ];
   if (def.actionMode) labels.push(`  action-mode: "${def.actionMode}"`);
+  // approval-queue-card: paused workers of this flow surface as cards
+  // in the approval queue UI. The /api/approvals route filters on this
+  // label exactly, so any workflow that pauses for staff review just
+  // works — no code change required to add new approval flows.
+  if (def.actionMode === "on_approval") labels.push(`  approval-queue-card: "true"`);
   if (def.taskPriority) labels.push(`  task-priority: "${def.taskPriority}"`);
   if (def.taskAssignedTo) labels.push(`  task-assigned-to: "${def.taskAssignedTo}"`);
   if (def.taskTitle) labels.push(`  task-title: "${def.taskTitle}"`);
@@ -321,9 +326,11 @@ errors:
 `
     : "";
 
+  // The Pause task id is `approval_gate` — matches the contract the
+  // /api/approvals route + ChildCard polling expect (gate.taskId).
   const approvalGate =
     def.actionMode === "on_approval"
-      ? `  - id: await_approval
+      ? `  - id: approval_gate
     type: io.kestra.plugin.core.flow.Pause
 
 `
@@ -396,11 +403,11 @@ triggers:
 
   const queryTask = `  - id: query_data_source
     type: io.kestra.plugin.core.http.Request
-    uri: "{{ kv('opendental_api_url') }}/queries/ShortQuery"
+    uri: "https://api.opendental.com/api/v1/queries/ShortQuery"
     method: PUT
     headers:
       Content-Type: application/json
-      Authorization: "ODFHIR {{ kv('opendental_api_key') }}"
+      Authorization: "ODFHIR {{ kv('opendental_developer_key') }}/{{ kv('opendental_customer_key') }}"
     body: |
       {"SqlCommand": "${def.triggerSql.replace(/"/g, '\\"').replace(/\n/g, " ")}"}`;
 

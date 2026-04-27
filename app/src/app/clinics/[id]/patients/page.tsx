@@ -84,7 +84,15 @@ export default function PatientLogPage() {
                     <div>
                       <p className="text-sm font-medium">{exec.flowId}</p>
                       <p className="text-xs text-muted-foreground">
-                        {exec.startDate ? new Date(exec.startDate).toLocaleString() : "—"}
+                        {/* Defensive — the /api/patients/search route already
+                            normalises Kestra's state.startDate into this
+                            field, but Number.isNaN guard prevents
+                            "Invalid Date" if the API ever returns garbage. */}
+                        {(() => {
+                          if (!exec.startDate) return "—";
+                          const d = new Date(exec.startDate);
+                          return Number.isNaN(d.getTime()) ? "—" : d.toLocaleString();
+                        })()}
                       </p>
                       {exec.record && (
                         <p className="text-xs text-muted-foreground mt-0.5">

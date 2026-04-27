@@ -1,8 +1,6 @@
 import { cookies } from 'next/headers'
 import { redirect } from 'next/navigation'
-import { isRedirectError } from 'next/dist/client/components/redirect-error'
 import { validateToken } from '@/lib/pulsar-auth'
-import { getOrCreateClinic } from '@/lib/clinic-context'
 
 export default async function HomePage() {
   const cookieStore = await cookies()
@@ -16,14 +14,8 @@ export default async function HomePage() {
     redirect('/login')
   }
 
-  let clinic
-  try {
-    clinic = await getOrCreateClinic(slug)
-  } catch (e) {
-    if (isRedirectError(e)) throw e
-    console.error('[HomePage] getOrCreateClinic failed:', e)
-    redirect('/login')
-  }
-
-  redirect(`/clinics/${clinic.id}/workflows`)
+  // Plan B: route directly by slug. The legacy `/clinics/[id]/workflows`
+  // tree was UUID-keyed against flowcore.clinics; under Plan B `[id]` is
+  // the slug itself and no DB row is created.
+  redirect(`/clinics/${slug}/workflows`)
 }

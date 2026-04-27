@@ -285,9 +285,10 @@ test.describe("Automation module — t-auto scenarios", () => {
 
 test.describe("Per-tenant data-isolation", () => {
   test("each tenant has its own MySQL schema (direct DB inspection)", async () => {
+    // Cross-platform: shell into the running pulsar-mysql container.
     const { execSync } = await import("node:child_process");
     const out = execSync(
-      `"C:\\Apps\\mysql-8.4\\bin\\mysql.exe" -uroot -ppulsar -h 127.0.0.1 -P 3316 -sN -e "SHOW DATABASES LIKE 'pulsar_t_%'"`,
+      `docker exec pulsar-mysql mysql -uroot -ppulsar -sN -e "SHOW DATABASES LIKE 'pulsar_t_%'"`,
       { encoding: "utf8" },
     );
     const dbs = out.split(/\r?\n/).filter(Boolean);
@@ -298,11 +299,11 @@ test.describe("Per-tenant data-isolation", () => {
   test("per-tenant staff data is physically isolated (t-office writes don't appear in t-content's DB)", async () => {
     const { execSync } = await import("node:child_process");
     const contentTables = execSync(
-      `"C:\\Apps\\mysql-8.4\\bin\\mysql.exe" -uroot -ppulsar -h 127.0.0.1 -P 3316 -sN -e "SHOW TABLES FROM pulsar_t_t_content"`,
+      `docker exec pulsar-mysql mysql -uroot -ppulsar -sN -e "SHOW TABLES FROM pulsar_t_t_content"`,
       { encoding: "utf8" },
     );
     const officeTables = execSync(
-      `"C:\\Apps\\mysql-8.4\\bin\\mysql.exe" -uroot -ppulsar -h 127.0.0.1 -P 3316 -sN -e "SHOW TABLES FROM pulsar_t_t_office"`,
+      `docker exec pulsar-mysql mysql -uroot -ppulsar -sN -e "SHOW TABLES FROM pulsar_t_t_office"`,
       { encoding: "utf8" },
     );
     // Content tenant has content tables; office tenant has staff tables. Never the other way around.

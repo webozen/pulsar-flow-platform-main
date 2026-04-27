@@ -4,9 +4,10 @@ const BACKEND = "http://localhost:18080";
 const APP = "http://localhost:3002";
 const PROXY = "http://localhost:5173";
 const ADMIN_PASSCODE = process.env.PULSAR_ADMIN_PASSCODE ?? "PULS-DEV-0000";
-const TENANT_SLUG = process.env.TEST_TENANT_SLUG ?? "acme";
+const TENANT_SLUG = process.env.TEST_TENANT_SLUG ?? "acme-dental";
 const TENANT_EMAIL = process.env.TEST_TENANT_EMAIL ?? "admin@acme.test";
-const TENANT_PASSCODE = process.env.TEST_TENANT_PASSCODE ?? "PULS-RVWK-NTWZ";
+// Tenant passcodes are generated per-tenant; pass via TEST_TENANT_PASSCODE.
+const TENANT_PASSCODE = process.env.TEST_TENANT_PASSCODE ?? "PULS-XXXX-XXXX";
 
 let tenantToken: string;
 

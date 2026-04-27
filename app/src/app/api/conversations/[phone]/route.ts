@@ -3,6 +3,8 @@ import { query, queryOne, initDb } from "@/lib/db";
 import { sendSms, getClinicTwilioAuth } from "@/lib/twilio";
 import { requireAuth, authErrorResponse } from "@/lib/pulsar-auth";
 import { getOrCreateClinic } from "@/lib/clinic-context";
+import { getKV } from "@/lib/kestra";
+import { namespaceFor } from "@/lib/tenant-sync";
 
 export const dynamic = "force-dynamic";
 
@@ -56,11 +58,12 @@ export async function POST(
       return NextResponse.json({ error: "body required" }, { status: 400 });
     }
 
-    const clinicRow = await queryOne<{ twilio_sid: string; twilio_from_number: string; kestra_namespace: string }>(
-      `SELECT twilio_sid, twilio_from_number, kestra_namespace FROM flowcore.clinics WHERE id = $1`,
-      [clinic.id]
-    );
-    if (!clinicRow?.twilio_sid || !clinicRow.twilio_from_number) {
+    // Twilio creds + sender number come from Kestra KV (Phase 2 cleanup:
+    // those columns dropped from flowcore.clinics).
+    const namespace = namespaceFor(slug);
+    const twilioSid = await getKV(namespace, "twilio_sid");
+    const twilioFromNumber = await getKV(namespace, "twilio_from_number");
+    if (!twilioSid || !twilioFromNumber) {
       return NextResponse.json({ error: "Clinic Twilio not configured" }, { status: 400 });
     }
 
@@ -76,17 +79,17 @@ export async function POST(
       );
     }
 
-    const authToken = await getClinicTwilioAuth(clinicRow.kestra_namespace);
+    const authToken = await getClinicTwilioAuth(namespace);
     const result = await sendSms(phone, body, {
-      sid: clinicRow.twilio_sid,
+      sid: twilioSid,
       authToken,
-      fromNumber: clinicRow.twilio_from_number,
+      fromNumber: twilioFromNumber,
     });
 
     await query(
       `INSERT INTO flowcore.sms_messages (clinic_id, direction, from_number, to_number, body, twilio_sid)
        VALUES ($1, 'outbound', $2, $3, $4, $5)`,
-      [clinic.id, clinicRow.twilio_from_number, phone, body, result.sid]
+      [clinic.id, twilioFromNumber, phone, body, result.sid]
     );
 
     return NextResponse.json({ ok: true, sid: result.sid });

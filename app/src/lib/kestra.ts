@@ -1,4 +1,6 @@
-const KESTRA_URL = process.env.KESTRA_API_URL || "http://localhost:8080";
+import { requireEnv } from "./env";
+
+export const KESTRA_URL = requireEnv("KESTRA_API_URL", "http://localhost:8080");
 
 async function kestraFetch(path: string, options?: RequestInit) {
   const res = await fetch(`${KESTRA_URL}${path}`, {
@@ -32,8 +34,15 @@ export async function createOrUpdateFlowFromYaml(yaml: string) {
     headers: { "Content-Type": "application/x-yaml" },
     body: yaml,
   });
-  if (res.status === 409) {
-    // Flow already exists — extract namespace/id from yaml and update
+  // Kestra signals "already exists" with either 409 (older versions) or
+  // 422 + message="Flow id already exists" (0.19+). Both → fall through to PUT.
+  let alreadyExists = res.status === 409;
+  let body = "";
+  if (!alreadyExists && !res.ok) {
+    body = await res.text();
+    if (res.status === 422 && body.includes("Flow id already exists")) alreadyExists = true;
+  }
+  if (alreadyExists) {
     const nsMatch = yaml.match(/^namespace:\s*(.+)$/m);
     const idMatch = yaml.match(/^id:\s*(.+)$/m);
     if (nsMatch && idMatch) {
@@ -45,14 +54,14 @@ export async function createOrUpdateFlowFromYaml(yaml: string) {
           body: yaml,
         }
       );
-      if (!updateRes.ok) throw new Error(`Kestra update error ${updateRes.status}`);
+      if (!updateRes.ok) {
+        const utext = await updateRes.text();
+        throw new Error(`Kestra update error ${updateRes.status}: ${utext}`);
+      }
       return updateRes.json();
     }
   }
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`Kestra create error ${res.status}: ${text}`);
-  }
+  if (!res.ok) throw new Error(`Kestra create error ${res.status}: ${body}`);
   return res.json();
 }
 
@@ -94,29 +103,30 @@ export async function replayExecution(executionId: string, taskRunId: string) {
   );
 }
 
-// Secrets
-export async function setSecret(namespace: string, key: string, value: string) {
-  const res = await fetch(
-    `${KESTRA_URL}/api/v1/namespaces/${namespace}/secrets/${key}`,
-    { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(value) }
-  );
-  if (!res.ok) throw new Error(`Kestra secret error ${res.status}`);
-}
+// `setSecret` was an attempt to write per-tenant secrets via Kestra
+// OSS's `/api/v1/namespaces/{ns}/secrets/{key}` endpoint. That endpoint
+// returns 404 in Kestra OSS — secrets are an enterprise feature.
+// Per-tenant secrets live in Kestra KV instead (see `setKV`/`getKV`),
+// and the legacy /api/secrets route now delegates to setKV directly.
 
 // Executions
 export async function listExecutions(params: {
   namespace?: string;
   state?: string;
+  flowId?: string;
   size?: number;
 }) {
   const qs = new URLSearchParams();
   if (params.namespace) qs.set("namespace", params.namespace);
   if (params.state) qs.set("state", params.state);
+  if (params.flowId) qs.set("flowId", params.flowId);
   qs.set("size", String(params.size || 25));
   return kestraFetch(`/api/v1/executions/search?${qs}`);
 }
 
 export async function resumeExecution(id: string) {
+  // Empty multipart body — gates in apt-reminder-row have no onResume
+  // inputs, so the resume payload is intentionally minimal.
   const res = await fetch(`${KESTRA_URL}/api/v1/executions/${id}/resume`, {
     method: "POST",
     headers: { "Content-Type": "multipart/form-data; boundary=----empty" },
@@ -126,15 +136,56 @@ export async function resumeExecution(id: string) {
   return { ok: true };
 }
 
+/** Hard kill via Kestra's DELETE /kill endpoint. Used when staff hits
+ *  Skip on a row execution — stops it before send_sms fires. With the
+ *  subflow-per-row architecture, killing an execution affects only
+ *  that one row; siblings are independent executions. */
 export async function killExecution(id: string) {
-  // Soft kill: resume the execution (it will complete with no actions or a log)
-  // This preserves the execution in Kestra's audit trail
-  // Then add a "rejected" label for tracking
-  await resumeExecution(id);
+  const res = await fetch(`${KESTRA_URL}/api/v1/executions/${id}/kill`, {
+    method: "DELETE",
+  });
+  if (!res.ok && res.status !== 202) {
+    const text = await res.text();
+    throw new Error(`Kestra kill error ${res.status}: ${text}`);
+  }
   return { ok: true };
 }
 
 // Namespace KV store
+/** Read a single KV value. Returns null when the key isn't set (Kestra
+ *  responds 404).
+ *
+ *  Kestra OSS 0.19 returns a typed envelope:
+ *    `{"type":"STRING","value":"<actual>"}`
+ *  for STRING values, not the raw string. Earlier code assumed a bare
+ *  JSON-quoted string and silently returned the envelope JSON as the
+ *  "key", which broke OpenDental and Twilio auth headers downstream
+ *  ("Invalid API key(s).").
+ *
+ *  We unwrap STRING / NUMBER / BOOLEAN / DURATION envelopes here so
+ *  callers get a native value. JSON / array / object KV values come
+ *  back as the parsed structure. */
+export async function getKV(namespace: string, key: string): Promise<string | null> {
+  const res = await fetch(`${KESTRA_URL}/api/v1/namespaces/${namespace}/kv/${key}`);
+  if (res.status === 404) return null;
+  if (!res.ok) throw new Error(`Kestra KV get error ${res.status}`);
+  const text = await res.text();
+  // Try the typed-envelope form first.
+  try {
+    const parsed = JSON.parse(text) as { type?: string; value?: unknown };
+    if (parsed && typeof parsed === "object" && "value" in parsed) {
+      const v = parsed.value;
+      if (v == null) return null;
+      return typeof v === "string" ? v : String(v);
+    }
+    // No envelope — fall back to JSON-string form.
+    return typeof parsed === "string" ? parsed : String(parsed);
+  } catch {
+    // Not JSON at all; return raw.
+    return text;
+  }
+}
+
 export async function setKV(namespace: string, key: string, value: string) {
   const res = await fetch(
     `${KESTRA_URL}/api/v1/namespaces/${namespace}/kv/${key}`,
@@ -147,52 +198,11 @@ export async function setKV(namespace: string, key: string, value: string) {
   if (!res.ok) throw new Error(`Kestra KV error ${res.status}`);
 }
 
-// Sync clinic config to Kestra namespace KV variables
-export async function syncClinicToKestra(clinic: {
-  kestraNamespace: string;
-  name: string;
-  phone?: string | null;
-  timezone: string;
-  opendentalApiUrl?: string | null;
-  opendentalApiKey?: string | null;
-  twilioSid?: string | null;
-  twilioAuthToken?: string | null;
-  twilioFromNumber?: string | null;
-  smtpHost?: string | null;
-  smtpPort?: number | null;
-  smtpUsername?: string | null;
-  smtpFrom?: string | null;
-  billingEmail?: string | null;
-  frontDeskEmail?: string | null;
-}) {
-  const ns = clinic.kestraNamespace;
-  const kvPairs: Record<string, string> = {
-    clinic_name: clinic.name,
-    timezone: clinic.timezone,
-    // App URL is used by voice call actions to build the TwiML callback URL
-    app_url: process.env.PUBLIC_APP_URL || "http://localhost:3000",
-  };
-
-  if (clinic.phone) kvPairs.clinic_phone = clinic.phone;
-  if (clinic.opendentalApiUrl) kvPairs.opendental_api_url = clinic.opendentalApiUrl;
-  if (clinic.opendentalApiKey) kvPairs.opendental_api_key = clinic.opendentalApiKey;
-  if (clinic.twilioSid) kvPairs.twilio_sid = clinic.twilioSid;
-  if (clinic.twilioFromNumber) kvPairs.twilio_from_number = clinic.twilioFromNumber;
-  // Compute Twilio Basic auth (Base64 of SID:AuthToken) for Kestra HTTP tasks
-  if (clinic.twilioSid && clinic.twilioAuthToken) {
-    const basicAuth = Buffer.from(`${clinic.twilioSid}:${clinic.twilioAuthToken}`).toString("base64");
-    kvPairs.twilio_basic_auth = basicAuth;
-  }
-  if (clinic.smtpHost) kvPairs.smtp_host = clinic.smtpHost;
-  if (clinic.smtpPort) kvPairs.smtp_port = String(clinic.smtpPort);
-  if (clinic.smtpUsername) kvPairs.smtp_username = clinic.smtpUsername;
-  if (clinic.smtpFrom) kvPairs.smtp_from = clinic.smtpFrom;
-  if (clinic.billingEmail) kvPairs.billing_team_email = clinic.billingEmail;
-  if (clinic.frontDeskEmail) kvPairs.front_desk_email = clinic.frontDeskEmail;
-
-  for (const [key, value] of Object.entries(kvPairs)) {
-    await setKV(ns, key, value);
-  }
-
-  return { synced: Object.keys(kvPairs).length };
-}
+// `syncClinicToKestra` was the Plan A bridge that copied per-tenant
+// secrets out of `flowcore.clinics` columns and INTO Kestra KV. Phase 2
+// cleanup dropped those columns; per-tenant secrets are now written
+// directly to KV (by pulsar-backend's automation-sync module via
+// `pushTenantSecrets`, or by an admin via /api/secrets). The function
+// had only one caller (`/api/clinics/[id]/sync`, now a deprecated
+// no-op) and used the WRONG KV key names anyway (`opendental_api_*`
+// instead of `opendental_developer_key`/`_customer_key`). Removed.

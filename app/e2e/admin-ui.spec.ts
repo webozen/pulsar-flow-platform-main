@@ -12,7 +12,7 @@
 import { test, expect, Page } from "@playwright/test";
 
 const FRONTEND = "http://localhost:5173";
-const ADMIN_PASSCODE = process.env.PULSAR_ADMIN_PASSCODE ?? "PULS-0000";
+const ADMIN_PASSCODE = process.env.PULSAR_ADMIN_PASSCODE ?? "PULS-DEV-0000";
 
 // Make every run unique so re-running doesn't hit "slug_taken".
 const RUN = Date.now();

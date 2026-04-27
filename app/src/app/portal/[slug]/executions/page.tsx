@@ -5,18 +5,29 @@ import { useParams } from "next/navigation";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { timeAgo, fullTimestamp } from "@/lib/time-ago";
 
 interface Execution {
   id: string;
   namespace: string;
   flowId: string;
-  state: { current: string; histories?: { date: string; state: { current: string } }[] };
+  // Kestra returns timestamps under `state.startDate`/`state.endDate`,
+  // not at the top level. Top-level fields are kept optional only for
+  // legacy mocks/seed data.
+  state: {
+    current: string;
+    startDate?: string;
+    endDate?: string;
+    histories?: { date: string; state: { current: string } }[];
+  };
   trigger?: { variables?: Record<string, unknown> };
-  startDate: string;
+  startDate?: string;
   endDate?: string;
   duration?: string;
-  taskRunList?: { id: string; taskId: string; state: { current: string }; startDate: string; outputs?: Record<string, unknown> }[];
+  taskRunList?: { id: string; taskId: string; state: { current: string }; startDate?: string; outputs?: Record<string, unknown> }[];
 }
+
+// `fmtExecDate` was a defensive Date formatter; replaced by `timeAgo`.
 
 function statusColor(status: string) {
   switch (status) {
@@ -69,9 +80,11 @@ export default function ExecutionsPage() {
                 <div className="flex items-center justify-between">
                   <div>
                     <CardTitle className="text-base">{exec.flowId}</CardTitle>
-                    <p className="text-xs text-muted-foreground">
-                      {new Date(exec.startDate).toLocaleString()}
-                      {exec.endDate && ` — ${new Date(exec.endDate).toLocaleString()}`}
+                    <p
+                      className="text-xs text-muted-foreground"
+                      title={fullTimestamp(exec.state?.startDate ?? exec.startDate)}
+                    >
+                      {timeAgo(exec.state?.startDate ?? exec.startDate)}
                     </p>
                   </div>
                   <Badge variant={statusColor(exec.state?.current)}>

@@ -12,7 +12,7 @@ import { test, expect, request as playwrightRequest } from "@playwright/test";
 
 const FRONTEND = "http://localhost:5173";
 const BACKEND = "http://localhost:18080";
-const ADMIN_PASSCODE = process.env.PULSAR_ADMIN_PASSCODE ?? "PULS-0000";
+const ADMIN_PASSCODE = process.env.PULSAR_ADMIN_PASSCODE ?? "PULS-DEV-0000";
 
 const RUN = Date.now();
 const SLUG = `reftimer-${RUN}`;

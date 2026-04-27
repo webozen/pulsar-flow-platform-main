@@ -26,3 +26,6 @@ docs/.obsidian/workspaces.json
 # Logs
 *.log
 logs/
+
+# Demo recordings + screenshots (large binaries)
+app/demo-output/

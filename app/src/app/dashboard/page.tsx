@@ -1,6 +1,12 @@
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { query, initDb } from "@/lib/db";
+import { cookies } from "next/headers";
+import { redirect } from "next/navigation";
+import { validateToken } from "@/lib/pulsar-auth";
+import { KESTRA_URL } from "@/lib/kestra";
+import { namespaceFor } from "@/lib/tenant-sync";
+import { timeAgo, fullTimestamp } from "@/lib/time-ago";
 import Link from "next/link";
 
 export const dynamic = "force-dynamic";
@@ -13,20 +19,44 @@ interface Execution {
   startDate?: string;
 }
 
-async function getStats() {
+/** Dashboard runs in the caller's tenant scope. Active Clinics tile was
+ *  removed because the dashboard is already per-tenant via the JWT —
+ *  there's no cross-tenant context here for a tenant user. Workflows
+ *  count and Kestra executions are now both filtered to the caller's
+ *  namespace; previously they read across all tenants. */
+async function getStats(slug: string) {
   await initDb();
-  const clinicRows = await query<{ cnt: number }>("SELECT count(*)::int as cnt FROM flowcore.clinics WHERE is_active = true");
-  const clinicCount: number = clinicRows[0]?.cnt ?? 0;
-  const workflowRows = await query<{ cnt: number }>("SELECT count(*)::int as cnt FROM flowcore.workflows WHERE is_enabled = true");
-  const workflowCount: number = workflowRows[0]?.cnt ?? 0;
+  const namespace = namespaceFor(slug);
+
+  // Workflows count = enabled flows actually deployed in the tenant's
+  // Kestra namespace. This includes platform-managed flows
+  // (apt-reminder-demo, apt-reminder-row, etc.) which never get rows
+  // in flowcore.workflows — they're deployed straight to Kestra by
+  // tenant-sync. Counting flowcore.workflows alone showed 0 for fresh
+  // tenants even though they have 4 flows live, which was misleading.
+  let workflowCount = 0;
+  try {
+    const flowRes = await fetch(
+      `${KESTRA_URL}/api/v1/flows/search?namespace=${encodeURIComponent(namespace)}&size=100`,
+      { cache: "no-store" },
+    );
+    if (flowRes.ok) {
+      const flows = (await flowRes.json()) as { results?: Array<{ disabled?: boolean }> };
+      workflowCount = (flows.results ?? []).filter((f) => !f.disabled).length;
+    }
+  } catch {
+    // Kestra not reachable — fall back to 0
+  }
 
   let execStats = { total: 0, success: 0, failed: 0, paused: 0 };
   let recentExecutions: Execution[] = [];
   const workflowCounts: Record<string, { success: number; failed: number; total: number }> = {};
 
   try {
-    const kestraUrl = process.env.KESTRA_API_URL || "http://localhost:8080";
-    const res = await fetch(`${kestraUrl}/api/v1/executions/search?size=100&page=1`, { cache: "no-store" });
+    const res = await fetch(
+      `${KESTRA_URL}/api/v1/executions/search?namespace=${encodeURIComponent(namespace)}&size=100&page=1`,
+      { cache: "no-store" },
+    );
     if (res.ok) {
       const data = await res.json();
       const results: Execution[] = data.results || [];
@@ -47,7 +77,7 @@ async function getStats() {
     // Kestra not available
   }
 
-  return { clinicCount, workflowCount, execStats, recentExecutions, workflowCounts };
+  return { workflowCount, execStats, recentExecutions, workflowCounts };
 }
 
 function statusColor(status: string) {
@@ -61,18 +91,30 @@ function statusColor(status: string) {
 }
 
 export default async function DashboardPage() {
-  const { clinicCount, workflowCount, execStats, recentExecutions, workflowCounts } = await getStats();
+  // Resolve tenant from JWT cookie. Without a token the page redirects
+  // to /login (handled at the layout level too, but enforced here so
+  // the dashboard never renders cross-tenant data by accident).
+  const cookieStore = await cookies();
+  const token = cookieStore.get("pulsar_jwt")?.value;
+  if (!token) redirect("/login");
+  let slug: string;
+  try {
+    ({ slug } = validateToken(token));
+  } catch {
+    redirect("/login");
+  }
+
+  const { workflowCount, execStats, recentExecutions, workflowCounts } = await getStats(slug);
 
   return (
     <div className="space-y-8">
       <div>
         <h1 className="text-2xl font-bold tracking-tight text-slate-900">Dashboard</h1>
-        <p className="text-[13px] text-slate-500 mt-1">Pulsar Flow dental automation overview</p>
+        <p className="text-[13px] text-slate-500 mt-1">Pulsar Flow — {slug}</p>
       </div>
 
-      {/* Stats row */}
-      <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
-        <StatCard title="Active Clinics" value={clinicCount} href="/clinics" color="blue" />
+      {/* Stats row — JWT-scoped to this tenant only. */}
+      <div className="grid gap-4 sm:grid-cols-3">
         <StatCard title="Active Workflows" value={workflowCount} color="violet" />
         <StatCard title="Pending Approvals" value={execStats.paused} href="/approvals" color="amber" />
         <StatCard title="Failed Runs" value={execStats.failed} color="red" />
@@ -134,7 +176,12 @@ export default async function DashboardPage() {
                   <div key={exec.id} className="flex items-center justify-between rounded-lg border px-4 py-2.5">
                     <div className="min-w-0">
                       <p className="text-sm font-medium truncate">{exec.flowId}</p>
-                      <p className="text-xs text-muted-foreground">{new Date(exec.startDate || exec.state?.startDate || "").toLocaleString()}</p>
+                      <p
+                        className="text-xs text-muted-foreground"
+                        title={fullTimestamp(exec.state?.startDate ?? exec.startDate)}
+                      >
+                        {timeAgo(exec.state?.startDate ?? exec.startDate)}
+                      </p>
                     </div>
                     <Badge className={`shrink-0 ${statusColor(exec.state?.current)}`}>
                       {exec.state?.current}
@@ -175,3 +222,6 @@ function StatCard({ title, value, href, color }: { title: string; value: number;
 
   return href ? <Link href={href}>{content}</Link> : content;
 }
+
+// `fmtExec` was a defensive Date formatter; replaced by `timeAgo` from
+// `@/lib/time-ago` which is null-safe AND emits relative time pills.

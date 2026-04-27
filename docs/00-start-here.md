@@ -19,8 +19,9 @@ Next.js App (:3000)  →  Kestra Engine (:8080)  →  Data Source API (e.g., Ope
 ## Reading order
 
 ### Architecture
-1. [[Platform Architecture]] — How the app, Kestra, and data sources fit together
-2. [[Execution Flow]] — End-to-end: trigger → query → actions → results
+1. [[System Overview]] — Cross-repo: backend + flow-platform + frontend, end-to-end flow, multi-tenancy
+2. [[Platform Architecture]] — Flow-platform internals (app + Kestra + data source)
+3. [[Execution Flow]] — End-to-end: trigger → query → actions → results
 
 ### Concepts
 3. [[Tenant Isolation]] — Namespace-per-tenant multi-tenancy

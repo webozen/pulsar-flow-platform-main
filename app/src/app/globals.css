@@ -127,4 +127,13 @@
   html {
     @apply font-sans;
   }
+  /* Brand-tinted focus ring for any focusable element. `--pulsar-primary`
+     is set at runtime by the `useBranding` hook (lib/use-branding.ts)
+     from the tenant's primaryColor — falls back to the Tailwind ring
+     value when no tenant brand is loaded. Buttons, inputs, links and
+     the nav tabs all pick this up via the global :focus-visible. */
+  :focus-visible {
+    outline: 2px solid var(--pulsar-primary, var(--ring));
+    outline-offset: 2px;
+  }
 }

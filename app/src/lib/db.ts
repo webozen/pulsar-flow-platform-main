@@ -13,37 +13,34 @@ export function getPool(): Pool {
   return globalForDb.pool;
 }
 
-export async function initDb() {
+// One-shot guard: every API route currently calls `await initDb()` defensively.
+// Running 11 CREATE TABLE IF NOT EXISTS statements on every request adds
+// 100-300ms latency for no useful work — the schema is already created by
+// `node scripts/migrate-pg.mjs`. Cache the first invocation per Node process.
+let initOnce: Promise<void> | null = null;
+export async function initDb(): Promise<void> {
+  if (initOnce) return initOnce;
+  initOnce = doInit().catch((e) => { initOnce = null; throw e; });
+  return initOnce;
+}
+
+async function doInit() {
   const pool = getPool();
   await pool.query(`CREATE SCHEMA IF NOT EXISTS flowcore`);
 
-  // Clinics — each clinic is a tenant with its own Kestra namespace
+  // Clinics — thin index for inbound webhook routing (Twilio number →
+  // slug) plus the dashboard's "active clinics" tile. Per-tenant
+  // secrets (Twilio, OpenDental, SMTP) live in Kestra KV under
+  // `dental.<slug>`. Phase 2 cleanup dropped Plan A leftover columns.
   await pool.query(`
     CREATE TABLE IF NOT EXISTS flowcore.clinics (
       id TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
       name TEXT NOT NULL,
       slug TEXT UNIQUE NOT NULL,
-      phone TEXT,
       timezone TEXT DEFAULT 'America/New_York',
-      kestra_namespace TEXT UNIQUE NOT NULL,
-      -- Open Dental API (replaces direct MySQL)
-      opendental_api_url TEXT,
-      opendental_api_key TEXT,
-      -- Twilio
-      twilio_sid TEXT,
       twilio_from_number TEXT,
-      -- SMTP
-      smtp_host TEXT,
-      smtp_port INT DEFAULT 587,
-      smtp_username TEXT,
-      smtp_from TEXT,
-      -- Routing
-      billing_email TEXT,
-      front_desk_email TEXT,
-      -- State
       is_active BOOLEAN DEFAULT true,
-      created_at TIMESTAMPTZ DEFAULT now(),
-      updated_at TIMESTAMPTZ DEFAULT now()
+      created_at TIMESTAMPTZ DEFAULT now()
     )
   `);
 
@@ -111,55 +108,9 @@ export async function initDb() {
     )
   `);
 
-  // Email messages — parallel to sms_messages. Inbound via SendGrid Parse,
-  // outbound via SendGrid Mail Send. Attachments stored separately.
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS flowcore.email_messages (
-      id TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
-      clinic_id TEXT NOT NULL REFERENCES flowcore.clinics(id) ON DELETE CASCADE,
-      direction TEXT NOT NULL CHECK (direction IN ('inbound','outbound')),
-      from_address TEXT NOT NULL,
-      to_address TEXT NOT NULL,
-      subject TEXT,
-      body_text TEXT,
-      body_html TEXT,
-      sendgrid_message_id TEXT,
-      pat_num TEXT,
-      execution_id TEXT,
-      keyword TEXT,
-      spam_score NUMERIC,
-      status TEXT,
-      created_at TIMESTAMPTZ DEFAULT now()
-    )
-  `);
-  await pool.query(`CREATE INDEX IF NOT EXISTS email_messages_clinic_from_idx ON flowcore.email_messages(clinic_id, from_address, created_at DESC)`);
-  await pool.query(`CREATE INDEX IF NOT EXISTS email_messages_sg_msg_idx ON flowcore.email_messages(sendgrid_message_id)`);
-
-  // Email attachments — one row per attachment on an inbound email
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS flowcore.email_attachments (
-      id TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
-      email_message_id TEXT NOT NULL REFERENCES flowcore.email_messages(id) ON DELETE CASCADE,
-      filename TEXT NOT NULL,
-      content_type TEXT,
-      size_bytes INT,
-      storage_path TEXT,
-      opendental_doc_num TEXT,
-      uploaded_to_opendental_at TIMESTAMPTZ,
-      created_at TIMESTAMPTZ DEFAULT now()
-    )
-  `);
-
-  // Email opt-outs — patients who unsubscribed or hard-bounced
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS flowcore.email_opt_outs (
-      clinic_id TEXT NOT NULL REFERENCES flowcore.clinics(id) ON DELETE CASCADE,
-      email_address TEXT NOT NULL,
-      reason TEXT,
-      created_at TIMESTAMPTZ DEFAULT now(),
-      PRIMARY KEY (clinic_id, email_address)
-    )
-  `);
+  // (Removed: email_messages, email_attachments, email_opt_outs — Phase 1
+  // dead-schema drop. Email feature isn't shipped; tables had zero
+  // INSERTs in code. Reintroduce when email actually goes live.)
 
   // Voice calls — outbound IVR calls (press 1 to confirm, etc.)
   await pool.query(`
@@ -179,18 +130,28 @@ export async function initDb() {
     )
   `);
 
-  // Users
+  // (Removed: flowcore.users — Phase 1 dead-schema drop. Auth lives in
+  // pulsar-backend's `pulsar_platform.public_tenants` and tenant JWT;
+  // flow-platform never had its own user store.)
+
+  // Approval audit log — one row per Approve/Skip click. Compliance
+  // surface: answers "who approved the SMS to patient X on date Y"
+  // even after Kestra retention rotates the execution.
   await pool.query(`
-    CREATE TABLE IF NOT EXISTS flowcore.users (
-      id TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
-      name TEXT,
-      email TEXT UNIQUE NOT NULL,
-      password TEXT,
-      role TEXT DEFAULT 'STAFF',
-      clinic_id TEXT REFERENCES flowcore.clinics(id),
-      created_at TIMESTAMPTZ DEFAULT now()
+    CREATE TABLE IF NOT EXISTS flowcore.approval_audit (
+      id            BIGSERIAL PRIMARY KEY,
+      ts            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      slug          TEXT NOT NULL,
+      actor_email   TEXT,
+      actor_role    TEXT,
+      action        TEXT NOT NULL CHECK (action IN ('approve','skip')),
+      execution_id  TEXT NOT NULL,
+      flow_id       TEXT,
+      payload       JSONB
     )
   `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS approval_audit_slug_ts_idx ON flowcore.approval_audit (slug, ts DESC)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS approval_audit_exec_idx ON flowcore.approval_audit (execution_id)`);
 }
 
 export async function query<T = Record<string, unknown>>(
