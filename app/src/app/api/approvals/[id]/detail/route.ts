@@ -1,16 +1,26 @@
 import { NextResponse } from "next/server";
 import { requireAuth, authErrorResponse } from "@/lib/pulsar-auth";
+import { KESTRA_URL } from "@/lib/kestra";
 
 export const dynamic = "force-dynamic";
 
-const KESTRA_URL = process.env.KESTRA_API_URL || "http://localhost:8080";
-
+/**
+ * GET /api/approvals/{execId}/detail
+ *
+ * For a row execution of `apt-reminder-row`, returns:
+ *   - recordData: the parsed `inputs.row` (the appointment record)
+ *   - actionPreviews: human-readable preview of every outbound action
+ *     in the flow, with templates resolved against recordData.
+ *   - taskRuns: lightweight state list for the UI.
+ *
+ * No taskRunId scoping needed — each execution has exactly one row.
+ */
 export async function GET(
   req: Request,
-  { params }: { params: Promise<{ id: string }> }
+  { params }: { params: Promise<{ id: string }> },
 ) {
   try {
-    requireAuth(req)
+    requireAuth(req);
     const { id } = await params;
 
     const res = await fetch(`${KESTRA_URL}/api/v1/executions/${id}`);
@@ -18,34 +28,20 @@ export async function GET(
 
     const exec = await res.json();
 
-    // Extract record data — per-record subflow has it in inputs.record
+    // Builder-generated worker flows pass the row as `inputs.record`
+    // (typed JSON). Legacy flows used `inputs.row`. Accept both.
     let recordData: Record<string, unknown> | null = null;
-    let queryResults: unknown[] = [];
-
-    if (exec.inputs?.record) {
-      const record = typeof exec.inputs.record === "string"
-        ? JSON.parse(exec.inputs.record)
-        : exec.inputs.record;
-      recordData = record;
-      queryResults = [record];
+    const rawRow = exec.inputs?.record ?? exec.inputs?.row;
+    if (rawRow) {
+      try {
+        const parsed = typeof rawRow === "string" ? JSON.parse(rawRow) : rawRow;
+        if (parsed && typeof parsed === "object") recordData = parsed as Record<string, unknown>;
+      } catch { /* not JSON */ }
     }
 
-    // Also check parent flow query outputs
-    for (const tr of exec.taskRunList || []) {
-      if (tr.taskId === "query_data_source" && tr.outputs?.body) {
-        const body = tr.outputs.body;
-        queryResults = typeof body === "string" ? JSON.parse(body) : body;
-        break;
-      }
-    }
-
-    // Extract labels
     const labels: Record<string, string> = {};
-    for (const l of exec.labels || []) {
-      labels[l.key] = l.value;
-    }
+    for (const l of exec.labels || []) labels[l.key] = l.value;
 
-    // Get the flow definition to extract action details
     const actionPreviews: ActionPreview[] = [];
     try {
       const flowRes = await fetch(`${KESTRA_URL}/api/v1/flows/${exec.namespace}/${exec.flowId}`);
@@ -62,7 +58,6 @@ export async function GET(
       state: exec.state?.current,
       labels,
       recordData,
-      queryResults,
       actionPreviews,
       taskRuns: (exec.taskRunList || []).map((tr: { taskId: string; state: { current: string } }) => ({
         taskId: tr.taskId,
@@ -80,15 +75,13 @@ interface ActionPreview {
   details: Record<string, string>;
 }
 
-/**
- * Walk the task tree, skip Pause tasks, resolve templates with record data,
- * and build human-readable previews of what each action will do.
- */
+/** Walk the task tree, skip Pause tasks, resolve templates with record
+ *  data, and build human-readable previews of what each action will do. */
 function extractActionPreviews(
   tasks: Record<string, unknown>[],
   record: Record<string, unknown> | null,
   previews: ActionPreview[],
-  afterPause = false
+  afterPause = false,
 ) {
   for (const task of tasks) {
     const type = (task.type as string) || "";
@@ -97,9 +90,13 @@ function extractActionPreviews(
       afterPause = true;
       continue;
     }
-
-    if (type.includes("Sequential") || type.includes("Parallel")) {
+    if (type.includes("Sequential") || type.includes("Parallel") || type.includes("ForEach")) {
       extractActionPreviews((task.tasks as Record<string, unknown>[]) || [], record, previews, afterPause);
+      continue;
+    }
+    if (type.includes("flow.If")) {
+      const then = (task as { then?: Record<string, unknown>[] }).then ?? [];
+      extractActionPreviews(then, record, previews, afterPause);
       continue;
     }
 
@@ -112,15 +109,18 @@ function extractActionPreviews(
       const resolvedUri = record ? resolveTemplate(uri, record) : uri;
 
       if (uri.includes("twilio")) {
-        // Parse SMS body from URL-encoded form
-        const msgMatch = resolved.match(/Body=([^&]*)/);
-        const toMatch = resolved.match(/To=([^&]*)/);
+        // The Twilio body is application/x-www-form-urlencoded — spaces
+        // are encoded as `+`. URLSearchParams handles both, giving us
+        // human-readable text.
+        const partsWithSpaces = resolved.replace(/\+/g, " ");
+        const params = new URLSearchParams(resolved);
+        const message = params.get("Body") ?? partsWithSpaces;
         previews.push({
           type: "sms",
           title: "Send SMS",
           details: {
-            to: toMatch ? decodeURIComponent(toMatch[1]) : "?",
-            message: msgMatch ? decodeURIComponent(msgMatch[1]) : resolved,
+            to: params.get("To") ?? "?",
+            message,
           },
         });
       } else if (uri.includes("smtp") || uri.includes("mail") || uri.includes("email")) {
@@ -149,26 +149,52 @@ function extractActionPreviews(
       }
     } else if (type.includes("Pause") && task.delay) {
       previews.push({ type: "delay", title: `Wait ${task.delay}`, details: { duration: task.delay as string } });
-    } else if (type.includes("Log")) {
-      // Skip log tasks
     }
   }
 }
 
-/** Resolve {{ inputs.record.field }} and {{ kv('x') }} templates with actual data */
-function resolveTemplate(template: string, record: Record<string, unknown>): string {
+/** Resolve common Pebble forms used in shipped flows so the action
+ *  preview renders the actual SMS/email/webhook the patient will
+ *  receive instead of raw `{{ … }}` syntax. Anything we don't
+ *  recognise stays as a `[name]` placeholder. */
+export function resolveTemplate(template: string, record: Record<string, unknown>): string {
   let result = template;
-  // Replace {{ inputs.record.field }}
-  result = result.replace(/\{\{\s*inputs\.record\.(\w+)\s*\}\}/g, (_match, field) => {
-    return String(record[field] ?? `[${field}]`);
-  });
-  // Replace {{ taskrun.value.field }}
-  result = result.replace(/\{\{\s*taskrun\.value\.(\w+)\s*\}\}/g, (_match, field) => {
-    return String(record[field] ?? `[${field}]`);
-  });
-  // Leave {{ kv('x') }} as-is but mark it
-  result = result.replace(/\{\{\s*kv\('(\w+)'\)\s*\}\}/g, (_match, key) => {
-    return `[${key}]`;
-  });
+
+  // {{ fromJson(inputs.row).field }} — apt-reminder-row's canonical form.
+  result = result.replace(
+    /\{\{\s*fromJson\(\s*inputs\.row\s*\)\.(\w+)\s*\}\}/g,
+    (_m, field) => String(record[field] ?? `[${field}]`),
+  );
+
+  // {{ inputs.row.field }} — same pattern without fromJson.
+  result = result.replace(/\{\{\s*inputs\.row\.(\w+)\s*\}\}/g, (_m, field) =>
+    String(record[field] ?? `[${field}]`),
+  );
+
+  // {{ fromJson(parents[0].taskrun.value).field }} — Sequential-wrapped
+  // ForEach iteration; kept for any flow still using the legacy shape.
+  result = result.replace(
+    /\{\{\s*fromJson\(\s*parents\[\d+\]\.taskrun\.value\s*\)\.(\w+)\s*\}\}/g,
+    (_m, field) => String(record[field] ?? `[${field}]`),
+  );
+
+  // {{ fromJson(taskrun.value).field }} — flat ForEach iteration.
+  result = result.replace(
+    /\{\{\s*fromJson\(\s*taskrun\.value\s*\)\.(\w+)\s*\}\}/g,
+    (_m, field) => String(record[field] ?? `[${field}]`),
+  );
+
+  // {{ inputs.record.field }} — non-ForEach single-row flows.
+  result = result.replace(/\{\{\s*inputs\.record\.(\w+)\s*\}\}/g, (_m, field) =>
+    String(record[field] ?? `[${field}]`),
+  );
+
+  // {{ taskrun.value.field }} — flat ForEach without fromJson.
+  result = result.replace(/\{\{\s*taskrun\.value\.(\w+)\s*\}\}/g, (_m, field) =>
+    String(record[field] ?? `[${field}]`),
+  );
+
+  // {{ kv('x') }} — leave as `[x]` since the preview doesn't have KV access.
+  result = result.replace(/\{\{\s*kv\(['"](\w+)['"]\)\s*\}\}/g, (_m, key) => `[${key}]`);
   return result;
 }

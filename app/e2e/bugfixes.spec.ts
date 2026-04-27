@@ -8,10 +8,11 @@ import { test, expect, request as playwrightRequest } from "@playwright/test";
 
 const BACKEND = "http://localhost:18080";
 const APP = "http://localhost:3002";
-const ADMIN_PASSCODE = process.env.PULSAR_ADMIN_PASSCODE ?? "PULS-PROD-3SOOFN-I3HA";
-const TENANT_SLUG = process.env.TEST_TENANT_SLUG ?? "acme";
+const ADMIN_PASSCODE = process.env.PULSAR_ADMIN_PASSCODE ?? "PULS-DEV-0000";
+const TENANT_SLUG = process.env.TEST_TENANT_SLUG ?? "acme-dental";
 const TENANT_EMAIL = process.env.TEST_TENANT_EMAIL ?? "admin@acme.test";
-const TENANT_PASSCODE = process.env.TEST_TENANT_PASSCODE ?? "PULS-RVWK-NTWZ";
+// Tenant passcodes are generated per-tenant; pass via TEST_TENANT_PASSCODE.
+const TENANT_PASSCODE = process.env.TEST_TENANT_PASSCODE ?? "PULS-XXXX-XXXX";
 
 let tenantToken: string;
 
@@ -97,9 +98,11 @@ test.describe("Bug #9 — TenantDto no longer leaks passcode", () => {
 
 test.describe("Passcode hashing at rest", () => {
   test("DB column stores a BCrypt hash, not the plaintext passcode", async () => {
+    // Cross-platform: shell into the running pulsar-mysql container
+    // (started by docker compose). Avoids depending on a host MySQL CLI.
     const { execSync } = await import("node:child_process");
     const out = execSync(
-      `"C:\\Apps\\mysql-8.4\\bin\\mysql.exe" -uroot -ppulsar -h 127.0.0.1 -P 3316 pulsar_platform -sN ` +
+      `docker exec pulsar-mysql mysql -uroot -ppulsar pulsar_platform -sN ` +
         `-e "SELECT access_passcode_hash FROM public_tenants WHERE slug='${TENANT_SLUG}'"`,
       { encoding: "utf8" },
     );
@@ -173,8 +176,21 @@ test.describe("Bug #6 — Redis dependency fully removed", () => {
   });
 
   test("nothing in the stack is listening on the old Redis port 6380", async ({ request }) => {
-    const { execSync } = await import("node:child_process");
-    const out = execSync("netstat -ano", { encoding: "utf8" });
-    expect(out).not.toMatch(/LISTENING\s+\d+\s*$/m.test(out) ? /:6380\s+\S+\s+LISTENING/ : /:6380/);
+    // Cross-platform: try to open a TCP connection. Anything other than
+    // a connection-refused/timeout means a process is listening on 6380.
+    const net = await import("node:net");
+    const isOpen = await new Promise<boolean>((resolve) => {
+      const socket = net.connect({ host: "127.0.0.1", port: 6380 });
+      const done = (open: boolean) => {
+        socket.destroy();
+        resolve(open);
+      };
+      socket.once("connect", () => done(true));
+      socket.once("error", () => done(false));
+      setTimeout(() => done(false), 1500);
+    });
+    expect(isOpen, "port 6380 should be closed (Redis dependency removed)").toBe(false);
+    // Suppress unused-binding lint: `request` arg is required by Playwright fixture
+    void request;
   });
 });

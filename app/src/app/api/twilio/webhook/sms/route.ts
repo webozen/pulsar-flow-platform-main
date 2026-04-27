@@ -1,6 +1,8 @@
-import { NextResponse } from "next/server";
 import { query, queryOne } from "@/lib/db";
 import { classifyInboundSms } from "@/lib/twilio";
+import { getKV, KESTRA_URL } from "@/lib/kestra";
+import { OPENDENTAL_BASE } from "@/lib/opendental";
+import { namespaceFor } from "@/lib/tenant-sync";
 
 export const dynamic = "force-dynamic";
 
@@ -22,33 +24,37 @@ export async function POST(req: Request) {
   const body = String(form.get("Body") || "");
   const messageSid = String(form.get("MessageSid") || "");
 
-  // Match the inbound "To" number to a clinic by twilio_from_number
-  const clinic = await queryOne<{ id: string; name: string; kestra_namespace: string }>(
-    `SELECT id, name, kestra_namespace FROM flowcore.clinics WHERE twilio_from_number = $1 LIMIT 1`,
+  // Inbound webhook routing: Twilio doesn't carry tenant identity, so we
+  // map the receiving number to a clinic. Phase 2 keeps this lookup
+  // small — only `slug` and `name` are needed; namespace is derived
+  // from slug.
+  const clinic = await queryOne<{ id: string; slug: string; name: string }>(
+    `SELECT id, slug, name FROM flowcore.clinics WHERE twilio_from_number = $1 LIMIT 1`,
     [to]
   );
 
   if (!clinic) {
-    // Unknown destination — log and return empty TwiML so Twilio doesn't retry
     console.warn(`[twilio.webhook.sms] no clinic matched To=${to}`);
     return new Response(`<?xml version="1.0" encoding="UTF-8"?><Response/>`, {
       headers: { "Content-Type": "text/xml" },
     });
   }
+  const namespace = namespaceFor(clinic.slug);
 
   const keyword = classifyInboundSms(body);
 
-  // Try to resolve the phone to a known patient via Open Dental mock
+  // Resolve phone → patient via OpenDental. Per-tenant credentials live
+  // in Kestra KV as `opendental_developer_key` + `opendental_customer_key`
+  // (the actual KV key names — earlier code looked for `_api_url`/`_api_key`
+  // which don't exist).
   let patNum: string | null = null;
   try {
-    const clinicRow = await queryOne<{ opendental_api_url: string; opendental_api_key: string }>(
-      `SELECT opendental_api_url, opendental_api_key FROM flowcore.clinics WHERE id = $1`,
-      [clinic.id]
-    );
-    if (clinicRow?.opendental_api_url) {
+    const dev = await getKV(namespace, "opendental_developer_key");
+    const cust = await getKV(namespace, "opendental_customer_key");
+    if (dev && cust) {
       const res = await fetch(
-        `${clinicRow.opendental_api_url}/patients?phone=${encodeURIComponent(from)}`,
-        { headers: { Authorization: `ODFHIR ${clinicRow.opendental_api_key || ""}` } }
+        `${OPENDENTAL_BASE}/patients?phone=${encodeURIComponent(from)}`,
+        { headers: { Authorization: `ODFHIR ${dev}/${cust}` } }
       );
       if (res.ok) {
         const rows = await res.json();
@@ -59,14 +65,12 @@ export async function POST(req: Request) {
     // Patient match is best-effort
   }
 
-  // Persist the inbound message
   await query(
     `INSERT INTO flowcore.sms_messages (clinic_id, direction, from_number, to_number, body, twilio_sid, keyword, pat_num)
      VALUES ($1, 'inbound', $2, $3, $4, $5, $6, $7)`,
     [clinic.id, from, to, body, messageSid, keyword, patNum]
   );
 
-  // Handle opt-out immediately
   if (keyword === "STOP") {
     await query(
       `INSERT INTO flowcore.sms_opt_outs (clinic_id, phone_number, reason)
@@ -82,21 +86,14 @@ export async function POST(req: Request) {
   }
 
   // Trigger a Kestra webhook flow if the clinic has one set up for inbound replies.
-  // Convention: flow id `inbound-sms` in the clinic namespace, with key `inbound-sms`.
-  // Flow receives { from, to, body, keyword, patNum, clinicId } and decides routing.
-  const kestraUrl = process.env.KESTRA_API_URL || "http://localhost:8080";
   try {
     await fetch(
-      `${kestraUrl}/api/v1/executions/webhook/${clinic.kestra_namespace}/inbound-sms/inbound-sms`,
+      `${KESTRA_URL}/api/v1/executions/webhook/${namespace}/inbound-sms/inbound-sms`,
       {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          from,
-          to,
-          body,
-          keyword,
-          patNum,
+          from, to, body, keyword, patNum,
           clinicId: clinic.id,
           messageSid,
         }),

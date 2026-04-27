@@ -1,0 +1,41 @@
+services:
+  postgres:
+    image: postgres:15
+    container_name: flowcore-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: kestra
+      POSTGRES_PASSWORD: ${KESTRA_POSTGRES_PASSWORD:-k3stra_dev}
+      POSTGRES_DB: kestra
+    ports:
+      - "5432:5432"
+    volumes:
+      - flowcore-pg-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U kestra -d kestra"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  kestra:
+    image: kestra/kestra:v0.19.11
+    container_name: flowcore-kestra
+    restart: unless-stopped
+    user: "root"
+    command: ["server", "standalone", "--worker-thread=10"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      KESTRA_POSTGRES_PASSWORD: ${KESTRA_POSTGRES_PASSWORD:-k3stra_dev}
+      MICRONAUT_CONFIG_FILES: /app/confs/application.yml
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./kestra/application.yml:/app/confs/application.yml:ro
+      - flowcore-kestra-storage:/app/storage
+      - /var/run/docker.sock:/var/run/docker.sock
+
+volumes:
+  flowcore-pg-data:
+  flowcore-kestra-storage:

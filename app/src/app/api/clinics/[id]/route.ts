@@ -1,72 +1,56 @@
 import { NextResponse } from 'next/server'
-import { query, queryOne, initDb } from '@/lib/db'
 import { requireAuth, authErrorResponse } from '@/lib/pulsar-auth'
+import { syntheticClinicFromSlug } from '@/lib/tenant-context'
 
 export const dynamic = 'force-dynamic'
 
-async function getOwnedClinic(req: Request, id: string) {
-  const { slug } = requireAuth(req)
-  await initDb()
-  const clinic = await queryOne<Record<string, unknown>>(
-    'SELECT * FROM flowcore.clinics WHERE id = $1 AND slug = $2',
-    [id, slug]
-  )
-  if (!clinic) throw Object.assign(new Error('Not found'), { status: 404 })
-  return clinic
-}
-
+/**
+ * Under Plan B `[id]` IS the slug. The legacy implementation read a row
+ * from flowcore.clinics; we now synthesize the same shape from the JWT slug
+ * so the UI keeps rendering. Any param value that doesn't match the JWT
+ * tenant is rejected as 404 to preserve the original ownership semantics.
+ */
 export async function GET(
   req: Request,
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
+    const { slug: jwtSlug } = requireAuth(req)
     const { id } = await params
-    const clinic = await getOwnedClinic(req, id)
-    return NextResponse.json(clinic)
-  } catch (e: unknown) {
-    if ((e as { status?: number }).status === 404) return NextResponse.json({ error: 'Not found' }, { status: 404 })
+    if (id !== jwtSlug) {
+      return NextResponse.json({ error: 'Not found' }, { status: 404 })
+    }
+    return NextResponse.json(syntheticClinicFromSlug(jwtSlug))
+  } catch (e) {
     return authErrorResponse(e)
   }
 }
 
+/**
+ * PUT used to update flowcore.clinics fields (twilio_sid, smtp_host, …).
+ * Under Plan B those secrets live in the tenant's Kestra namespace KV and
+ * are pushed via `/api/automation/tenant-sync/secrets` from pulsar-backend
+ * after the tenant onboards opendental-ai (or in future a dedicated
+ * provider-credentials onboarding flow). The legacy PUT is a no-op now;
+ * we return 200 with a deprecation note so existing UI buttons don't error.
+ */
 export async function PUT(
   req: Request,
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
+    const { slug: jwtSlug } = requireAuth(req)
     const { id } = await params
-    await getOwnedClinic(req, id)
-    const data = await req.json()
-    await query(
-      `UPDATE flowcore.clinics SET
-        name = COALESCE($1, name),
-        phone = COALESCE($2, phone),
-        timezone = COALESCE($3, timezone),
-        opendental_api_url = COALESCE($4, opendental_api_url),
-        opendental_api_key = COALESCE($5, opendental_api_key),
-        twilio_sid = COALESCE($6, twilio_sid),
-        twilio_from_number = COALESCE($7, twilio_from_number),
-        smtp_host = COALESCE($8, smtp_host),
-        smtp_port = COALESCE($9, smtp_port),
-        smtp_username = COALESCE($10, smtp_username),
-        smtp_from = COALESCE($11, smtp_from),
-        billing_email = COALESCE($12, billing_email),
-        front_desk_email = COALESCE($13, front_desk_email),
-        updated_at = now()
-      WHERE id = $14`,
-      [
-        data.name || null, data.phone || null, data.timezone || null,
-        data.opendentalApiUrl || null, data.opendentalApiKey || null,
-        data.twilioSid || null, data.twilioFromNumber || null,
-        data.smtpHost || null, data.smtpPort ? parseInt(data.smtpPort) : null,
-        data.smtpUsername || null, data.smtpFrom || null,
-        data.billingEmail || null, data.frontDeskEmail || null,
-        id,
-      ]
-    )
-    return NextResponse.json({ ok: true })
-  } catch (e: unknown) {
-    if ((e as { status?: number }).status === 404) return NextResponse.json({ error: 'Not found' }, { status: 404 })
+    if (id !== jwtSlug) {
+      return NextResponse.json({ error: 'Not found' }, { status: 404 })
+    }
+    return NextResponse.json({
+      ok: true,
+      deprecated: true,
+      reason: 'Tenant config now lives in Pulsar (public_tenants) + Kestra namespace KV. ' +
+              'Push provider creds via POST /api/automation/tenant-sync/secrets from pulsar-backend.',
+    })
+  } catch (e) {
     return authErrorResponse(e)
   }
 }

@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { useParams, useRouter } from "next/navigation";
+import Link from "next/link";
 import { clientFetch } from "@/lib/client-fetch";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -54,10 +55,35 @@ export default function EditWorkflowPage() {
   const [taskTitle, setTaskTitle] = useState("");
   const [taskPriority, setTaskPriority] = useState("MEDIUM");
   const [taskAssignedTo, setTaskAssignedTo] = useState("");
+  // Platform-managed flows (deployed by the Pulsar tenant-sync bridge from
+  // YAML on disk) can't round-trip through the structured builder, so we
+  // render a comprehensive read-only view instead. The full Kestra flow
+  // JSON is what the read-only view renders against — no synthesis.
+  // platform-managed flag controls the amber "edits get overwritten on
+  // next provision" warning at the top of the page.
+  const [platformManaged, setPlatformManaged] = useState(false);
+  // Two-mode Edit: "builder" (default — same UI as Create with values
+  // pre-filled) and "summary" (read-only structured view of every task
+  // and label). Tab switcher at the top toggles between them.
+  const [viewMode, setViewMode] = useState<"builder" | "summary">("builder");
+  const [flowDefinition, setFlowDefinition] = useState<Record<string, unknown> | null>(null);
+  const [flowJsonPretty, setFlowJsonPretty] = useState<string>("");
+  const [rawYamlUrl, setRawYamlUrl] = useState<string>("");
 
   useEffect(() => {
     import("@/lib/trigger-library").then((mod) => setTriggers(mod.TRIGGER_LIBRARY));
   }, []);
+
+  // Same stale-URL guard as the workflows list page — see comment there.
+  useEffect(() => {
+    clientFetch(`/api/auth/me`).then(async (r) => {
+      if (!r.ok) return;
+      const me = await r.json();
+      if (me?.slug && me.slug !== String(clinicId ?? "")) {
+        router.replace(`/clinics/${me.slug}/workflows`);
+      }
+    });
+  }, [clinicId, router]);
 
   useEffect(() => {
     clientFetch(`/api/workflows/${wfId}`).then(async (res) => {
@@ -69,6 +95,16 @@ export default function EditWorkflowPage() {
         setCustomSql(wf.trigger_sql || "");
         const acts = typeof wf.actions === "string" ? JSON.parse(wf.actions) : wf.actions;
         setActions(Array.isArray(acts) ? acts : []);
+        // The "When Triggered" radio defaulted to "immediate" regardless of
+        // what the API returned. Read action_mode (on_approval / immediate /
+        // manual) from the response so the form reflects reality.
+        if (wf.action_mode === "on_approval" || wf.action_mode === "immediate" || wf.action_mode === "manual") {
+          setActionMode(wf.action_mode);
+        }
+        setPlatformManaged(!!wf.platform_managed);
+        setFlowDefinition(wf.flow_definition ?? null);
+        setFlowJsonPretty(wf.flow_json_pretty ?? "");
+        setRawYamlUrl(wf.raw_yaml_url ?? "");
         // Try to match trigger event from library
         import("@/lib/trigger-library").then((mod) => {
           const match = mod.TRIGGER_LIBRARY.find((t) => t.sql === wf.trigger_sql);
@@ -113,8 +149,28 @@ export default function EditWorkflowPage() {
 
   if (loading) return <p className="text-muted-foreground">Loading...</p>;
 
+  if (viewMode === "summary") {
+    return (
+      <>
+        <ViewModeTabs viewMode={viewMode} setViewMode={setViewMode} platformManaged={platformManaged} />
+        <ReadOnlyFlowView
+          wfId={String(wfId ?? "")}
+          name={name}
+          description={description}
+          triggerCron={triggerCron}
+          customSql={customSql}
+          flowDefinition={flowDefinition}
+          flowJsonPretty={flowJsonPretty}
+          rawYamlUrl={rawYamlUrl}
+          clinicId={String(clinicId ?? "")}
+        />
+      </>
+    );
+  }
+
   return (
     <div className="mx-auto max-w-2xl space-y-6">
+      <ViewModeTabs viewMode={viewMode} setViewMode={setViewMode} platformManaged={platformManaged} />
       <h1 className="text-2xl font-bold">Edit Workflow</h1>
       <form onSubmit={handleSubmit} className="space-y-6">
         <Card>
@@ -257,4 +313,346 @@ export default function EditWorkflowPage() {
       </form>
     </div>
   );
+}
+
+/** Two-tab switcher at the top of the Edit page: Builder (default, looks
+ *  like Create) and Summary (read-only structured view). */
+function ViewModeTabs({
+  viewMode, setViewMode, platformManaged,
+}: {
+  viewMode: "builder" | "summary"
+  setViewMode: (m: "builder" | "summary") => void
+  platformManaged: boolean
+}) {
+  return (
+    <div className="mb-4 flex items-center justify-between">
+      <div className="bg-slate-100 rounded-lg p-1 flex text-sm" data-testid="view-mode-tabs">
+        <button
+          type="button"
+          onClick={() => setViewMode("builder")}
+          className={`px-3 py-1.5 rounded-md transition ${viewMode === "builder" ? "bg-white text-slate-900 shadow-sm" : "text-slate-600 hover:text-slate-900"}`}
+          data-testid="tab-builder"
+        >
+          Builder
+        </button>
+        <button
+          type="button"
+          onClick={() => setViewMode("summary")}
+          className={`px-3 py-1.5 rounded-md transition ${viewMode === "summary" ? "bg-white text-slate-900 shadow-sm" : "text-slate-600 hover:text-slate-900"}`}
+          data-testid="tab-summary"
+        >
+          Summary
+        </button>
+      </div>
+      {platformManaged && (
+        <span className="text-xs text-amber-700" data-testid="platform-managed-warning">
+          Platform-managed flow — edits push to Kestra now, but the next tenant-sync provision will overwrite.
+        </span>
+      )}
+    </div>
+  )
+}
+
+/**
+ * Comprehensive read-only view for platform-managed flows (deployed by
+ * Pulsar tenant-sync from YAML on disk). Renders everything we know about
+ * the flow against the live Kestra `flow_definition` so what's on screen
+ * always matches what's actually running. No data is hidden, nothing is
+ * synthesized.
+ */
+function ReadOnlyFlowView({
+  wfId, name, description, triggerCron, customSql, flowDefinition, flowJsonPretty, rawYamlUrl, clinicId,
+}: {
+  wfId: string
+  name: string
+  description: string
+  triggerCron: string
+  customSql: string
+  flowDefinition: Record<string, unknown> | null
+  flowJsonPretty: string
+  rawYamlUrl: string
+  clinicId: string
+}) {
+  const def = flowDefinition ?? {}
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const tasks = ((def as any).tasks ?? []) as Array<Record<string, unknown>>
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const triggers = ((def as any).triggers ?? []) as Array<Record<string, unknown>>
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const labels = ((def as any).labels ?? []) as Array<{ key: string; value: string }>
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const disabled = !!(def as any).disabled
+
+  return (
+    <div className="mx-auto max-w-4xl space-y-6" data-testid="readonly-flow-view">
+      <div className="flex items-center justify-between">
+        <div>
+          <h1 className="text-2xl font-bold" data-testid="flow-name">{name}</h1>
+          <p className="text-xs text-muted-foreground mt-1">
+            Platform-managed flow — read-only here. To change the YAML, open the Kestra editor.
+          </p>
+        </div>
+        <div className="flex gap-2">
+          <Badge className={disabled ? "bg-slate-200 text-slate-700" : "bg-emerald-100 text-emerald-800 border-emerald-200"}>
+            {disabled ? "Disabled" : "Active"}
+          </Badge>
+          {rawYamlUrl && (
+            <a href={rawYamlUrl} target="_blank" rel="noopener noreferrer">
+              <Button size="sm" variant="outline" data-testid="open-kestra-editor">Open in Kestra</Button>
+            </a>
+          )}
+          <Link href={`/clinics/${clinicId}/workflows`}>
+            <Button size="sm" variant="ghost">Back</Button>
+          </Link>
+        </div>
+      </div>
+
+      {description && (
+        <Card>
+          <CardHeader><CardTitle className="text-base">What this flow does</CardTitle></CardHeader>
+          <CardContent>
+            <p className="text-sm text-slate-700 leading-relaxed" data-testid="flow-description">
+              {humanizeDescription(description)}
+            </p>
+          </CardContent>
+        </Card>
+      )}
+
+      <Card>
+        <CardHeader><CardTitle className="text-base">When it runs</CardTitle></CardHeader>
+        <CardContent className="space-y-2">
+          {triggers.length === 0 && <p className="text-sm" data-testid="trigger-manual">Manual only — staff hits Execute to start a run.</p>}
+          {triggers.map((t, i) => (
+            <div key={i} className="text-sm" data-testid={`trigger-${i}`}>
+              <div className="font-medium text-slate-800">
+                {t.cron ? humanizeCron(String(t.cron)) : "On event"}
+                {t.timezone ? <span className="text-slate-500"> · {String(t.timezone)}</span> : null}
+              </div>
+              <div className="text-xs text-muted-foreground mt-0.5">
+                {summarizeTriggerType(String(t.type ?? ""))}
+              </div>
+            </div>
+          ))}
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader>
+          <CardTitle className="text-base">
+            Steps <span className="text-xs font-normal text-muted-foreground">({tasks.length} task{tasks.length === 1 ? "" : "s"})</span>
+          </CardTitle>
+          <p className="text-xs text-muted-foreground mt-1">
+            What runs in order. Each <span className="font-medium text-amber-700">approval gate</span> below is what staff sees in the Approval Queue.
+          </p>
+        </CardHeader>
+        <CardContent className="space-y-2">
+          {tasks.length === 0 && <p className="text-sm text-muted-foreground">No steps defined.</p>}
+          {flattenSteps(tasks).map((step, i) => (
+            <StepRow key={i} step={step} index={i} />
+          ))}
+        </CardContent>
+      </Card>
+
+      {customSql && (
+        <Card>
+          <CardHeader><CardTitle className="text-base">SQL it runs against OpenDental</CardTitle></CardHeader>
+          <CardContent>
+            <pre className="whitespace-pre-wrap text-xs font-mono bg-slate-50 border rounded p-3 overflow-x-auto" data-testid="flow-sql">
+              {customSql}
+            </pre>
+          </CardContent>
+        </Card>
+      )}
+
+      {labels.length > 0 && (
+        <Card>
+          <CardHeader><CardTitle className="text-base">Labels</CardTitle></CardHeader>
+          <CardContent className="flex flex-wrap gap-2">
+            {labels.map((l, i) => (
+              <Badge key={i} className="bg-slate-100 text-slate-800 border border-slate-200" data-testid={`label-${i}`}>
+                {l.key}: {l.value}
+              </Badge>
+            ))}
+          </CardContent>
+        </Card>
+      )}
+
+      {flowJsonPretty && (
+        <details className="rounded border bg-white">
+          <summary className="cursor-pointer px-4 py-2 text-xs text-muted-foreground">
+            Raw flow definition (JSON) — for debugging
+          </summary>
+          <pre className="text-[11px] font-mono bg-slate-900 text-slate-100 rounded-b p-3 overflow-auto max-h-96" data-testid="flow-json">
+            {flowJsonPretty}
+          </pre>
+        </details>
+      )}
+    </div>
+  )
+}
+
+// ── Plain-English helpers ───────────────────────────────────────────────
+
+/** Strip the "Requirements per tenant" / "Reads OpenDental via..." dev
+ *  notes that the YAML descriptions used to embed. Returns the first
+ *  user-facing paragraph only. */
+function humanizeDescription(raw: string): string {
+  const trimmed = raw.trim()
+  // Cut at first occurrence of dev-only markers.
+  const cuts = ["\n\nReads ", "\n\nRequirements ", "\nRequirements ", "\n\n#", "\nsecrets:", "\nkv:"]
+  let end = trimmed.length
+  for (const c of cuts) {
+    const idx = trimmed.indexOf(c)
+    if (idx !== -1 && idx < end) end = idx
+  }
+  return trimmed.slice(0, end).replace(/\s+/g, " ").trim()
+}
+
+/** "0 7 * * *" → "Daily at 7:00 AM". Falls back to the raw cron string
+ *  for expressions we don't recognise. */
+function humanizeCron(cron: string): string {
+  const m = cron.trim().match(/^(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)$/)
+  if (!m) return cron
+  const [, min, hr, dom, mon, dow] = m
+  if (mon === "*" && dom === "*" && dow === "*" && /^\d+$/.test(min) && /^\d+$/.test(hr)) {
+    const h = Number(hr), mi = Number(min)
+    const ampm = h >= 12 ? "PM" : "AM"
+    const h12 = h % 12 === 0 ? 12 : h % 12
+    return `Daily at ${h12}:${mi.toString().padStart(2, "0")} ${ampm}`
+  }
+  if (min === "*/5" && hr === "*") return "Every 5 minutes"
+  if (min === "0" && hr === "*") return "Hourly"
+  return `Cron: ${cron}`
+}
+
+function summarizeTriggerType(type: string): string {
+  if (type.endsWith("Schedule")) return "Scheduled trigger"
+  if (type.endsWith("Webhook")) return "Webhook trigger"
+  if (type.endsWith("Trigger")) return "Polling trigger"
+  return type || "Trigger"
+}
+
+// ── Step flattening + rendering ─────────────────────────────────────────
+
+interface FlatStep {
+  id: string
+  type: string
+  description?: string
+  depth: number
+  // Pretty role for the row's left badge.
+  role: "fetch" | "approval" | "loop" | "condition" | "send-sms" | "send-email" | "log" | "task"
+  // Headline string (used as the row's main label).
+  headline: string
+  // Optional secondary line.
+  detail?: string
+}
+
+function flattenSteps(tasks: Array<Record<string, unknown>>, depth = 0): FlatStep[] {
+  const out: FlatStep[] = []
+  for (const t of tasks) {
+    const id = String(t.id ?? "")
+    const type = String(t.type ?? "")
+    const description = (t.description ? String(t.description) : "").trim() || undefined
+    const role = classifyStep(type, t)
+    const headline = headlineFor(role, id, t)
+    const detail = detailFor(role, t)
+    out.push({ id, type, description, depth, role, headline, detail })
+    // Recurse into nested task lists Kestra exposes (ForEach.tasks, If.then, Switch.cases, …)
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const child = (t as any).tasks ?? (t as any).then ?? null
+    if (Array.isArray(child)) out.push(...flattenSteps(child, depth + 1))
+  }
+  return out
+}
+
+function classifyStep(type: string, t: Record<string, unknown>): FlatStep["role"] {
+  if (type.includes("flow.Pause")) return "approval"
+  if (type.includes("flow.ForEach")) return "loop"
+  if (type.includes("flow.If") || type.includes("flow.Switch")) return "condition"
+  if (type.includes("log.Log")) return "log"
+  if (type.includes("http.Request")) {
+    const uri = String((t as { uri?: unknown }).uri ?? "")
+    if (/twilio\.com.*Messages/i.test(uri)) return "send-sms"
+    if (/sendgrid|smtp/i.test(uri)) return "send-email"
+    if (/opendental|ShortQuery/i.test(uri)) return "fetch"
+    return "task"
+  }
+  if (type.includes("MailSend")) return "send-email"
+  return "task"
+}
+
+function headlineFor(role: FlatStep["role"], id: string, t: Record<string, unknown>): string {
+  switch (role) {
+    case "fetch": return "Pull rows from OpenDental"
+    case "approval": return "Wait for staff approval"
+    case "loop": {
+      const v = String((t as { values?: unknown }).values ?? "")
+      const m = v.match(/outputs\.(\w+)\.body/)
+      return m ? `For each row from "${m[1]}"…` : "For each row…"
+    }
+    case "condition": return "Check a condition"
+    case "send-sms": return "Send SMS via Twilio"
+    case "send-email": return "Send email"
+    case "log": return "Record to log"
+    default: return id || "Task"
+  }
+}
+
+function detailFor(role: FlatStep["role"], t: Record<string, unknown>): string | undefined {
+  if (role === "approval") {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const inputs = ((t as any).onResume ?? []) as Array<{ id?: string; type?: string }>
+    if (inputs.length) return `Approver supplies: ${inputs.map((i) => `${i.id}:${i.type}`).join(", ")}`
+  }
+  if (role === "send-sms") {
+    const body = String((t as { body?: unknown }).body ?? "")
+    const m = body.match(/Body=([^&]+)/)
+    if (m) {
+      const txt = decodeURIComponent(m[1].replace(/\+/g, " "))
+      return txt.length > 120 ? txt.slice(0, 117) + "…" : txt
+    }
+  }
+  if (role === "fetch") {
+    return "Read-only HTTPS PUT to /queries/ShortQuery"
+  }
+  return undefined
+}
+
+const ROLE_BADGE: Record<FlatStep["role"], { label: string; cls: string }> = {
+  "fetch":      { label: "Fetch",     cls: "bg-sky-100 text-sky-800 border border-sky-200" },
+  "approval":   { label: "Approval",  cls: "bg-amber-100 text-amber-800 border border-amber-200" },
+  "loop":       { label: "Loop",      cls: "bg-slate-100 text-slate-700 border border-slate-200" },
+  "condition":  { label: "If",        cls: "bg-slate-100 text-slate-700 border border-slate-200" },
+  "send-sms":   { label: "SMS",       cls: "bg-emerald-100 text-emerald-800 border border-emerald-200" },
+  "send-email": { label: "Email",     cls: "bg-emerald-100 text-emerald-800 border border-emerald-200" },
+  "log":        { label: "Log",       cls: "bg-slate-100 text-slate-500 border border-slate-200" },
+  "task":       { label: "Task",      cls: "bg-slate-100 text-slate-700 border border-slate-200" },
+}
+
+function StepRow({ step, index }: { step: FlatStep; index: number }) {
+  const badge = ROLE_BADGE[step.role]
+  return (
+    <div className="flex items-start gap-3 text-sm" data-testid={`step-${index}`}>
+      <div className="text-xs text-slate-400 font-mono mt-1 w-5 shrink-0 text-right">{index + 1}.</div>
+      <div className="shrink-0" style={{ marginLeft: step.depth * 12 }}>
+        <span className={`inline-block text-[10px] px-1.5 py-0.5 rounded ${badge.cls}`}>
+          {badge.label}
+        </span>
+      </div>
+      <div className="flex-1 min-w-0">
+        <div className="font-medium text-slate-800">
+          {step.headline}
+        </div>
+        <div className="text-xs text-muted-foreground mt-0.5">
+          <span className="text-slate-400">id:</span> <span className="font-mono">{step.id}</span>
+        </div>
+        {step.description && (
+          <div className="text-xs text-muted-foreground mt-1 leading-relaxed">{step.description}</div>
+        )}
+        {step.detail && (
+          <div className="text-xs text-slate-500 mt-1 italic">"{step.detail}"</div>
+        )}
+      </div>
+    </div>
+  )
 }

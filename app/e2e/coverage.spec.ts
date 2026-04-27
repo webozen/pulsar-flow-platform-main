@@ -2,18 +2,25 @@ import { test, expect, request as playwrightRequest } from "@playwright/test";
 
 const BACKEND = "http://localhost:18080";
 const APP = "http://localhost:3002";
-const TENANT_SLUG = process.env.TEST_TENANT_SLUG ?? "acme";
+const TENANT_SLUG = process.env.TEST_TENANT_SLUG ?? "acme-dental";
 const TENANT_EMAIL = process.env.TEST_TENANT_EMAIL ?? "admin@acme.test";
-const TENANT_PASSCODE = process.env.TEST_TENANT_PASSCODE ?? "PULS-RVWK-NTWZ";
+// Tenant passcodes are generated per-tenant; pass via TEST_TENANT_PASSCODE.
+// The default below is a placeholder shape — a real passcode regen is
+// needed for any non-test environment.
+const TENANT_PASSCODE = process.env.TEST_TENANT_PASSCODE ?? "PULS-XXXX-XXXX";
 
 let tenantToken: string;
 let clinicId: string;
+let originalModules: string[] = [];
+let tenantId: number | undefined;
 
 test.beforeAll(async () => {
   const api = await playwrightRequest.newContext();
 
-  // Ensure the acme tenant has NO modules activated, so the "403 when not active"
-  // assertions below are deterministic. Earlier test runs may have activated some.
+  // Save the current active modules and clear them so the "403 when not
+  // active" assertions below are deterministic. We restore in afterAll —
+  // failing to do so leaves the live tenant in a state that breaks
+  // subsequent test runs (no automation = no apt-reminder-demo flow).
   const adminLogin = await api.post(`${BACKEND}/api/admin/login`, {
     data: { passcode: process.env.PULSAR_ADMIN_PASSCODE ?? "PULS-DEV-0000" },
   });
@@ -23,6 +30,8 @@ test.beforeAll(async () => {
   })).json();
   const acme = tenants.find((t: { slug: string }) => t.slug === TENANT_SLUG);
   if (acme) {
+    tenantId = acme.id;
+    originalModules = Array.isArray(acme.activeModules) ? acme.activeModules : [];
     await api.patch(`${BACKEND}/api/admin/tenants/${acme.id}/modules`, {
       headers: { Authorization: `Bearer ${adminToken}`, "Content-Type": "application/json" },
       data: { modules: [] },
@@ -42,6 +51,22 @@ test.beforeAll(async () => {
   const list = await clinics.json();
   clinicId = list.find((c: { slug: string; id: string }) => c.slug === TENANT_SLUG)?.id;
   expect(clinicId).toBeTruthy();
+});
+
+test.afterAll(async () => {
+  // Restore the modules so the live tenant returns to its pre-test
+  // state. Without this, subsequent runs that depend on `automation`
+  // (e.g. apt-reminder-demo flow being deployed) fail.
+  if (tenantId === undefined) return;
+  const api = await playwrightRequest.newContext();
+  const adminLogin = await api.post(`${BACKEND}/api/admin/login`, {
+    data: { passcode: process.env.PULSAR_ADMIN_PASSCODE ?? "PULS-DEV-0000" },
+  });
+  const adminToken = (await adminLogin.json()).token;
+  await api.patch(`${BACKEND}/api/admin/tenants/${tenantId}/modules`, {
+    headers: { Authorization: `Bearer ${adminToken}`, "Content-Type": "application/json" },
+    data: { modules: originalModules },
+  });
 });
 
 function authHeaders() {
@@ -207,7 +232,7 @@ test.describe("Twilio webhooks (public)", () => {
 
 test.describe("Kestra integration", () => {
   test("Kestra API reachable from the test host", async ({ request }) => {
-    const r = await request.get("http://localhost:8088/api/v1/executions/search?size=1");
+    const r = await request.get("http://localhost:8080/api/v1/executions/search?size=1");
     expect(r.status()).toBeLessThan(500);
   });
 
@@ -224,7 +249,7 @@ test.describe("Kestra integration", () => {
 test.describe("Backend modules — per-module ping endpoints", () => {
   // Once a tenant enables these modules via admin API, their ping routes should work.
   // Before activation, they're gated by RequireModule and should return 403.
-  const modules = ["scheduling", "payroll", "hr", "inventory", "crm", "invoicing", "content", "automation", "ai-notes"];
+  const modules = ["scheduling", "payroll", "hr", "inventory", "invoicing", "content", "automation", "ai-notes"];
 
   for (const m of modules) {
     test(`GET /api/${m}/ping is gated by RequireModule (403 when not active)`, async ({ request }) => {
@@ -269,7 +294,7 @@ test.describe("Backend tenant-scoped data", () => {
     expect([401, 403]).toContain(r.status());
   });
 
-  test("admin can list tenants and see both acme + beta", async ({ request }) => {
+  test("admin can list tenants and see the test tenant", async ({ request }) => {
     const adminLogin = await request.post(`${BACKEND}/api/admin/login`, {
       data: { passcode: process.env.PULSAR_ADMIN_PASSCODE ?? "PULS-DEV-0000" },
     });
@@ -280,6 +305,6 @@ test.describe("Backend tenant-scoped data", () => {
     expect(r.ok()).toBeTruthy();
     const list = await r.json();
     const slugs = list.map((t: { slug: string }) => t.slug);
-    expect(slugs).toContain("acme");
+    expect(slugs).toContain(TENANT_SLUG);
   });
 });

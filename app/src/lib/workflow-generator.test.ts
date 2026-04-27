@@ -117,10 +117,16 @@ describe("workflow-generator", () => {
       actionMode: "on_approval",
       actions: [{ type: "sms", message: "approved action" }],
     });
-    // Parent fans out to {flowId}-run via a Subflow; worker has the Pause gate.
+    // Parent fans out to {flowId}-run via a Subflow; worker has the Pause
+    // task with id `approval_gate` (matches the contract /api/approvals
+    // and the polling effect expect: gate.taskId === "approval_gate").
     expect(yaml).toContain("trigger_worker");
     expect(yaml).toContain("io.kestra.plugin.core.flow.Subflow");
-    expect(yaml).toContain("await_approval");
+    expect(yaml).toContain("id: approval_gate");
+    expect(yaml).toContain("io.kestra.plugin.core.flow.Pause");
+    // Workflows in on_approval mode emit the queue-card label so the
+    // approval queue surfaces them — no hardcoded flowId allowlist.
+    expect(yaml).toContain('approval-queue-card: "true"');
   });
 
   it("always emits parent + worker pair for scheduled workflows", () => {

@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { useParams } from "next/navigation";
+import { useParams, useRouter } from "next/navigation";
 import { clientFetch } from "@/lib/client-fetch";
 import Link from "next/link";
 import { Button } from "@/components/ui/button";
@@ -9,6 +9,9 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Input } from "@/components/ui/input";
+import { Skeleton } from "@/components/ui/skeleton";
+import { timeAgo, fullTimestamp } from "@/lib/time-ago";
+import { RefreshCw } from "lucide-react";
 
 // ── Types ──────────────────────────────────────────────────────
 
@@ -41,8 +44,11 @@ interface Execution {
   id: string;
   namespace: string;
   flowId: string;
-  state: { current: string };
-  startDate: string;
+  // Kestra returns startDate/endDate under state, NOT at the top level.
+  // Top-level startDate is left optional only because some legacy
+  // mocks/seed data set it; runtime data has it nested.
+  state: { current: string; startDate?: string; endDate?: string };
+  startDate?: string;
   endDate?: string;
   taskRunList?: { taskId: string; state: { current: string } }[];
 }
@@ -51,17 +57,34 @@ interface Execution {
 
 export default function WorkflowsPage() {
   const { id: clinicId } = useParams();
-  const [clinicName, setClinicName] = useState("");
-  const [clinicSlug, setClinicSlug] = useState("");
-  const [clinicNamespace, setClinicNamespace] = useState("");
+  const router = useRouter();
+  const slugFromUrl = String(clinicId ?? "");
+  const [clinicName, setClinicName] = useState(slugFromUrl);
+  const [clinicSlug, setClinicSlug] = useState(slugFromUrl);
+  const [clinicNamespace, setClinicNamespace] = useState(slugFromUrl ? `dental.${slugFromUrl}` : "");
+
+  // Guard against stale URLs: bookmarks or browser history from before the
+  // Plan B slug-keyed refactor still point at `/clinics/<old-uuid>/...`.
+  // Fetch the JWT's actual slug and redirect if the URL is wrong; otherwise
+  // the page would render an empty Kestra namespace (`dental.<uuid>`) and
+  // show "no workflows / no actions".
+  useEffect(() => {
+    clientFetch(`/api/auth/me`).then(async (r) => {
+      if (!r.ok) return;
+      const me = await r.json();
+      if (me?.slug && me.slug !== slugFromUrl) {
+        router.replace(`/clinics/${me.slug}/workflows`);
+      }
+    });
+  }, [slugFromUrl, router]);
 
   useEffect(() => {
     clientFetch(`/api/clinics/${clinicId}`).then(async (r) => {
       if (r.ok) {
         const c = await r.json();
-        setClinicName(c.name);
-        setClinicSlug(c.slug);
-        setClinicNamespace(c.kestra_namespace);
+        if (c?.name) setClinicName(c.name);
+        if (c?.slug) setClinicSlug(c.slug);
+        if (c?.kestra_namespace) setClinicNamespace(c.kestra_namespace);
       }
     });
   }, [clinicId]);
@@ -79,32 +102,11 @@ export default function WorkflowsPage() {
             <p className="text-xs text-muted-foreground">{clinicNamespace}</p>
           </div>
         </div>
-        <div className="flex items-center gap-2">
-          <Link href={`/portal/${clinicSlug}`} target="_blank">
-            <Button variant="ghost" size="sm" className="text-muted-foreground">
-              <svg className="mr-1.5 h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}><path strokeLinecap="round" strokeLinejoin="round" d="M13.5 6H5.25A2.25 2.25 0 003 8.25v10.5A2.25 2.25 0 005.25 21h10.5A2.25 2.25 0 0018 18.75V10.5m-10.5 6L21 3m0 0h-5.25M21 3v5.25" /></svg>
-              Portal
-            </Button>
-          </Link>
-          <Link href={`/clinics/${clinicId}/playbooks`}>
-            <Button variant="ghost" size="sm" className="text-muted-foreground">
-              <svg className="mr-1.5 h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}><path strokeLinecap="round" strokeLinejoin="round" d="M12 6.042A8.967 8.967 0 006 3.75c-1.052 0-2.062.18-3 .512v14.25A8.987 8.987 0 016 18c2.305 0 4.408.867 6 2.292m0-14.25a8.966 8.966 0 016-2.292c1.052 0 2.062.18 3 .512v14.25A8.987 8.987 0 0018 18a8.967 8.967 0 00-6 2.292m0-14.25v14.25" /></svg>
-              Playbooks
-            </Button>
-          </Link>
-          <Link href={`/clinics/${clinicId}/patients`}>
-            <Button variant="ghost" size="sm" className="text-muted-foreground">
-              <svg className="mr-1.5 h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}><path strokeLinecap="round" strokeLinejoin="round" d="M15.75 6a3.75 3.75 0 11-7.5 0 3.75 3.75 0 017.5 0zM4.501 20.118a7.5 7.5 0 0114.998 0A17.933 17.933 0 0112 21.75c-2.676 0-5.216-.584-7.499-1.632z" /></svg>
-              Patient Log
-            </Button>
-          </Link>
-          <Link href={`/clinics/${clinicId}/settings`}>
-            <Button variant="ghost" size="sm" className="text-muted-foreground">
-              <svg className="mr-1.5 h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}><path strokeLinecap="round" strokeLinejoin="round" d="M9.594 3.94c.09-.542.56-.94 1.11-.94h2.593c.55 0 1.02.398 1.11.94l.213 1.281c.063.374.313.686.645.87.074.04.147.083.22.127.324.196.72.257 1.075.124l1.217-.456a1.125 1.125 0 011.37.49l1.296 2.247a1.125 1.125 0 01-.26 1.431l-1.003.827c-.293.24-.438.613-.431.992a6.759 6.759 0 010 .255c-.007.378.138.75.43.99l1.005.828c.424.35.534.954.26 1.43l-1.298 2.247a1.125 1.125 0 01-1.369.491l-1.217-.456c-.355-.133-.75-.072-1.076.124a6.57 6.57 0 01-.22.128c-.331.183-.581.495-.644.869l-.213 1.28c-.09.543-.56.941-1.11.941h-2.594c-.55 0-1.02-.398-1.11-.94l-.213-1.281c-.062-.374-.312-.686-.644-.87a6.52 6.52 0 01-.22-.127c-.325-.196-.72-.257-1.076-.124l-1.217.456a1.125 1.125 0 01-1.369-.49l-1.297-2.247a1.125 1.125 0 01.26-1.431l1.004-.827c.292-.24.437-.613.43-.992a6.932 6.932 0 010-.255c.007-.378-.138-.75-.43-.99l-1.004-.828a1.125 1.125 0 01-.26-1.43l1.297-2.247a1.125 1.125 0 011.37-.491l1.216.456c.356.133.751.072 1.076-.124.072-.044.146-.087.22-.128.332-.183.582-.495.644-.869l.214-1.281z" /></svg>
-              Settings
-            </Button>
-          </Link>
-        </div>
+        {/* Quick-links removed — Portal/Playbooks/Patient Log/Settings pages
+            still live in the legacy app/src/app/clinics/[id]/* tree but they
+            depend on flowcore.* tables we're phasing out (Plan B). Surface
+            them again once they're ported to slug-keyed routes against the
+            Kestra namespace. */}
       </div>
 
       <Tabs defaultValue="workflows">
@@ -133,6 +135,15 @@ export default function WorkflowsPage() {
 }
 
 // ── Tab 1: Workflows ───────────────────────────────────────────
+
+/** Description fields imported from YAML can run multiple paragraphs.
+ *  Surface only the first non-empty line in the card; full text is one
+ *  click away in the Kestra editor. */
+function firstLine(s: string): string {
+  const trimmed = (s || "").trim();
+  const idx = trimmed.indexOf("\n");
+  return idx === -1 ? trimmed : trimmed.slice(0, idx).trim();
+}
 
 function modeBadge(mode?: string) {
   switch (mode) {
@@ -180,7 +191,27 @@ function WorkflowsTab({ clinicId }: { clinicId: string }) {
     load();
   }
 
-  if (loading) return <p className="text-muted-foreground">Loading...</p>;
+  if (loading) {
+    return (
+      // Skeletons match the shape of the workflow list rows (icon + name
+      // + meta + actions). Bounded count so the placeholder doesn't
+      // dominate the page when the real list is shorter.
+      <div className="space-y-3 pt-4" data-testid="workflows-loading">
+        {[0, 1, 2, 3].map((i) => (
+          <Card key={i} className="p-4">
+            <div className="flex items-center gap-4">
+              <Skeleton className="h-9 w-9 rounded-full" />
+              <div className="flex-1 space-y-2">
+                <Skeleton className="h-4 w-56" />
+                <Skeleton className="h-3 w-72" />
+              </div>
+              <Skeleton className="h-8 w-20" />
+            </div>
+          </Card>
+        ))}
+      </div>
+    );
+  }
 
   return (
     <div className="space-y-4 pt-4">
@@ -202,11 +233,16 @@ function WorkflowsTab({ clinicId }: { clinicId: string }) {
       {workflows.length === 0 ? (
         <Card>
           <CardContent className="flex flex-col items-center py-12 text-center">
-            <div className="rounded-full bg-blue-50 p-4 mb-4">
+            <div className="rounded-full bg-blue-50 p-4 mb-4 ring-1 ring-blue-100">
               <svg className="h-8 w-8 text-blue-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}><path strokeLinecap="round" strokeLinejoin="round" d="M3.75 13.5l10.5-11.25L12 10.5h8.25L9.75 21.75 12 13.5H3.75z" /></svg>
             </div>
             <h3 className="font-semibold text-lg">No workflows yet</h3>
-            <p className="text-sm text-muted-foreground mt-1">Create your first automation to get started.</p>
+            <p className="text-sm text-muted-foreground mt-1 mb-4 max-w-sm">
+              Create your first automation, or trigger a platform-managed workflow from Kestra to populate this list.
+            </p>
+            <Link href={`/clinics/${clinicId}/workflows/new`}>
+              <Button size="sm">+ Create workflow</Button>
+            </Link>
           </CardContent>
         </Card>
       ) : (
@@ -224,7 +260,11 @@ function WorkflowsTab({ clinicId }: { clinicId: string }) {
                         {wf.is_enabled ? "Active" : "Disabled"}
                       </Badge>
                     </div>
-                    {wf.description && <p className="text-sm text-muted-foreground">{wf.description}</p>}
+                    {wf.description && (
+                      <p className="text-sm text-muted-foreground line-clamp-2 max-w-3xl">
+                        {firstLine(wf.description)}
+                      </p>
+                    )}
                     <div className="flex items-center gap-3 mt-2 text-xs text-muted-foreground">
                       <span className="flex items-center gap-1">
                         <svg className="h-3 w-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M12 6v6h4.5m4.5 0a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
@@ -246,6 +286,9 @@ function WorkflowsTab({ clinicId }: { clinicId: string }) {
                     <Button size="sm" variant="ghost" onClick={() => setPreviewId(previewId === wf.id ? null : wf.id)} title="Preview flow">
                       <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}><path strokeLinecap="round" strokeLinejoin="round" d="M7.5 21L3 16.5m0 0L7.5 12M3 16.5h13.5m0-13.5L21 7.5m0 0L16.5 12M21 7.5H7.5" /></svg>
                     </Button>
+                    {/* Edit opens the same custom builder that Create uses,
+                        keyed on the Kestra flow id (was a flowcore.workflows
+                        UUID pre-Plan B). */}
                     <Link href={`/clinics/${clinicId}/workflows/${wf.id}`}>
                       <Button size="sm" variant="outline">Edit</Button>
                     </Link>
@@ -367,14 +410,22 @@ function TriggersTab({ clinicId }: { clinicId: string }) {
                       {testResult.rowCount} rows &middot; Placeholders: {testResult.placeholders.join(", ")}
                     </p>
                     {testResult.rows.length > 0 && (
-                      <div className="overflow-x-auto">
+                      <div className="overflow-auto max-h-72 rounded border">
                         <table className="text-xs w-full">
-                          <thead>
-                            <tr>{testResult.columns.map((c) => <th key={c} className="text-left px-2 py-1 border-b">{c}</th>)}</tr>
+                          <thead className="sticky top-0 z-10 bg-slate-50 shadow-[inset_0_-1px_0_var(--border)]">
+                            <tr>{testResult.columns.map((c) => (
+                              <th key={c} className="text-left px-2 py-1.5 font-medium text-slate-700 whitespace-nowrap">{c}</th>
+                            ))}</tr>
                           </thead>
                           <tbody>
                             {testResult.rows.slice(0, 3).map((row, i) => (
-                              <tr key={i}>{testResult.columns.map((c) => <td key={c} className="px-2 py-1 border-b">{String(row[c] ?? "")}</td>)}</tr>
+                              <tr key={i} className="even:bg-slate-50/40 hover:bg-slate-50">
+                                {testResult.columns.map((c) => (
+                                  <td key={c} className="px-2 py-1 border-t border-slate-100 max-w-xs truncate" title={String(row[c] ?? "")}>
+                                    {String(row[c] ?? "")}
+                                  </td>
+                                ))}
+                              </tr>
                             ))}
                           </tbody>
                         </table>
@@ -477,15 +528,21 @@ function ReportsTab({ clinicId }: { clinicId: string }) {
             </div>
           </CardHeader>
           <CardContent>
-            <div className="overflow-x-auto max-h-96">
+            <div className="overflow-auto max-h-96 rounded border">
               <table className="text-xs w-full">
-                <thead className="sticky top-0 bg-white">
-                  <tr>{result.columns.map((c) => <th key={c} className="text-left px-2 py-1 border-b font-medium">{c}</th>)}</tr>
+                <thead className="sticky top-0 z-10 bg-slate-50 shadow-[inset_0_-1px_0_var(--border)]">
+                  <tr>{result.columns.map((c) => (
+                    <th key={c} className="text-left px-2 py-1.5 font-medium text-slate-700 whitespace-nowrap">{c}</th>
+                  ))}</tr>
                 </thead>
                 <tbody>
                   {result.rows.map((row, i) => (
-                    <tr key={i} className="hover:bg-gray-50">
-                      {result.columns.map((c) => <td key={c} className="px-2 py-1 border-b">{String(row[c] ?? "")}</td>)}
+                    <tr key={i} className="even:bg-slate-50/40 hover:bg-slate-50">
+                      {result.columns.map((c) => (
+                        <td key={c} className="px-2 py-1 border-t border-slate-100 max-w-xs truncate" title={String(row[c] ?? "")}>
+                          {String(row[c] ?? "")}
+                        </td>
+                      ))}
                     </tr>
                   ))}
                 </tbody>
@@ -542,23 +599,55 @@ function AuditTab({ namespace }: { namespace: string }) {
     }
   }
 
-  if (loading) return <p className="text-muted-foreground pt-4">Loading...</p>;
+  if (loading) {
+    return (
+      <div className="space-y-3 pt-4" data-testid="audit-loading">
+        {[0, 1, 2, 3, 4].map((i) => (
+          <Card key={i} className="p-3">
+            <div className="flex items-center justify-between">
+              <div className="flex-1 space-y-1.5">
+                <Skeleton className="h-3.5 w-44" />
+                <Skeleton className="h-3 w-32" />
+              </div>
+              <Skeleton className="h-5 w-16 rounded-full" />
+            </div>
+          </Card>
+        ))}
+      </div>
+    );
+  }
 
   return (
     <div className="space-y-4 pt-4">
-      <div className="flex gap-2">
-        {["", "SUCCESS", "FAILED", "PAUSED", "RUNNING"].map((s) => (
-          <Button
-            key={s}
-            size="sm"
-            variant={statusFilter === s ? "default" : "outline"}
-            onClick={() => setStatusFilter(s)}
-          >
-            {s || "All"}
-          </Button>
-        ))}
+      <div className="flex gap-2 flex-wrap">
+        {(() => {
+          // Pre-compute counts so each filter chip can show how many
+          // executions match it. "All" reports the unfiltered total.
+          const counts: Record<string, number> = { "": executions.length };
+          for (const e of executions) {
+            const s = e.state?.current ?? "";
+            counts[s] = (counts[s] ?? 0) + 1;
+          }
+          return ["", "SUCCESS", "FAILED", "PAUSED", "RUNNING"].map((s) => (
+            <Button
+              key={s}
+              size="sm"
+              variant={statusFilter === s ? "default" : "outline"}
+              onClick={() => setStatusFilter(s)}
+              className="gap-1.5"
+            >
+              {s || "All"}
+              <span className="rounded-full bg-black/10 dark:bg-white/15 px-1.5 text-[10px] font-medium tabular-nums">
+                {counts[s] ?? 0}
+              </span>
+            </Button>
+          ));
+        })()}
         <div className="flex-1" />
-        <Button size="sm" variant="outline" onClick={load}>Refresh</Button>
+        <Button size="sm" variant="outline" onClick={load} className="gap-1.5">
+          <RefreshCw className="h-3.5 w-3.5" />
+          Refresh
+        </Button>
       </div>
 
       {filtered.length === 0 ? (
@@ -575,8 +664,18 @@ function AuditTab({ namespace }: { namespace: string }) {
                 <div>
                   <p className="text-sm font-medium">{exec.flowId}</p>
                   <p className="text-xs text-muted-foreground">
-                    {new Date(exec.startDate).toLocaleString()}
-                    {exec.endDate && ` — ${new Date(exec.endDate).toLocaleString()}`}
+                    {/* Kestra returns timestamps under state.startDate /
+                        state.endDate. Reading exec.startDate directly
+                        produced "Invalid Date" in the audit log. */}
+                    {(() => {
+                      const start = exec.state?.startDate ?? (exec as { startDate?: string }).startDate;
+                      const end = exec.state?.endDate;
+                      return (
+                        <span title={fullTimestamp(start) + (end ? ` → ${fullTimestamp(end)}` : "")}>
+                          {timeAgo(start)}{end ? ` · ran for ${duration(start, end)}` : ""}
+                        </span>
+                      );
+                    })()}
                   </p>
                 </div>
                 <div className="flex items-center gap-2">
@@ -586,6 +685,22 @@ function AuditTab({ namespace }: { namespace: string }) {
                       Retry
                     </Button>
                   )}
+                  {/* Deep-link into the Kestra UI for power users — clicking
+                      opens that execution's task tree in Kestra's own
+                      console (full logs, replay, inputs/outputs, gantt). */}
+                  <a
+                    href={`http://localhost:8080/ui/executions/${namespace}/${exec.flowId}/${exec.id}`}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    onClick={(e) => e.stopPropagation()}
+                    className="text-slate-400 hover:text-slate-700 transition-colors"
+                    title="Open in Kestra"
+                    aria-label="Open in Kestra"
+                  >
+                    <svg className="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                      <path strokeLinecap="round" strokeLinejoin="round" d="M14 5h5v5M19 5L10 14M5 5h4v2H7v10h10v-2h2v4H5z" />
+                    </svg>
+                  </a>
                 </div>
               </div>
 
@@ -606,4 +721,20 @@ function AuditTab({ namespace }: { namespace: string }) {
       )}
     </div>
   );
+}
+
+// `fmtAuditDate` was a defensive "—" fallback formatter; replaced by
+// `timeAgo` from `@/lib/time-ago` which handles the same null/parse
+// edge cases AND returns relative time pills.
+
+/** Compact "ran for 12s" duration pill for completed executions. */
+function duration(start: string | null | undefined, end: string | null | undefined): string {
+  if (!start || !end) return "";
+  const ms = new Date(end).getTime() - new Date(start).getTime();
+  if (!Number.isFinite(ms) || ms < 0) return "";
+  if (ms < 1000) return `${ms}ms`;
+  if (ms < 60_000) return `${Math.round(ms / 1000)}s`;
+  const m = Math.floor(ms / 60_000);
+  const s = Math.round((ms % 60_000) / 1000);
+  return `${m}m ${s}s`;
 }

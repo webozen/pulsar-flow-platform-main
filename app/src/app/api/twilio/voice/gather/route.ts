@@ -1,4 +1,6 @@
 import { query, queryOne } from "@/lib/db";
+import { KESTRA_URL } from "@/lib/kestra";
+import { namespaceFor } from "@/lib/tenant-sync";
 
 export const dynamic = "force-dynamic";
 
@@ -22,17 +24,17 @@ export async function POST(req: Request) {
     [digit, callSid]
   );
 
-  const clinic = await queryOne<{ id: string; kestra_namespace: string }>(
-    `SELECT id, kestra_namespace FROM flowcore.clinics WHERE twilio_from_number = $1 LIMIT 1`,
+  const clinic = await queryOne<{ id: string; slug: string }>(
+    `SELECT id, slug FROM flowcore.clinics WHERE twilio_from_number = $1 LIMIT 1`,
     [to] // "To" from Twilio's perspective is our From (the call leg coming back)
   );
 
   // Fire a Kestra webhook so the workflow can react to the digit
   if (clinic) {
-    const kestraUrl = process.env.KESTRA_API_URL || "http://localhost:8080";
+    const namespace = namespaceFor(clinic.slug);
     try {
       await fetch(
-        `${kestraUrl}/api/v1/executions/webhook/${clinic.kestra_namespace}/voice-response/voice-response`,
+        `${KESTRA_URL}/api/v1/executions/webhook/${namespace}/voice-response/voice-response`,
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
