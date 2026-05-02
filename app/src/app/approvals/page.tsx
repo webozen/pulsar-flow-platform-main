@@ -52,7 +52,7 @@ interface ApprovalDetail {
 }
 
 interface Outcome {
-  summary: "sent" | "failed" | "skipped" | "running" | "pending";
+  summary: "sent" | "failed" | "skipped" | "running" | "pending" | "unreachable";
   detail: string;
   sentTo?: string | null;
   sentBody?: string | null;
@@ -316,24 +316,50 @@ function ApprovalCard(props: {
 
   // Poll /outcome while chip is "running" — survives slow Kestra
   // workers and never gets garbage-collected mid-flight.
+  // Exponential backoff: consecutive fetch errors double the delay
+  // (2s → 4s → 8s → 10s cap). After 5 consecutive errors polling
+  // stops and the card enters "unreachable" state.
   const isRunning = outcome?.summary === "running";
+  const errorCount = useRef(0);
+  const timeoutHandle = useRef<ReturnType<typeof setTimeout> | null>(null);
   useEffect(() => {
     if (!isRunning) return;
+    errorCount.current = 0;
     let cancelled = false;
-    let t: ReturnType<typeof setTimeout> | null = null;
     const tick = async () => {
-      const o = await fetchOutcome();
+      let o: Outcome | null = null;
+      try {
+        o = await fetchOutcome();
+      } catch {
+        o = null;
+      }
       if (cancelled) return;
-      if (o) {
+      if (o !== null) {
+        // Successful response — reset error streak and apply outcome.
+        errorCount.current = 0;
         applyOutcome(o);
         if (o.summary === "sent" || o.summary === "failed" || o.summary === "skipped") return;
+        // Still running: poll again in 1s (happy path unchanged).
+        timeoutHandle.current = setTimeout(tick, 1000);
+      } else {
+        // Failed/error response — back off exponentially.
+        errorCount.current += 1;
+        if (errorCount.current >= 5) {
+          // Give up — mark card as unreachable so the user can see it.
+          applyOutcome({
+            summary: "unreachable",
+            detail: "Kestra is not responding. Refresh the page to retry.",
+          });
+          return;
+        }
+        const delay = Math.min(1000 * 2 ** errorCount.current, 10_000);
+        timeoutHandle.current = setTimeout(tick, delay);
       }
-      t = setTimeout(tick, 1000);
     };
-    t = setTimeout(tick, 500);
+    timeoutHandle.current = setTimeout(tick, 500);
     return () => {
       cancelled = true;
-      if (t) clearTimeout(t);
+      if (timeoutHandle.current) clearTimeout(timeoutHandle.current);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isRunning, approval.executionId]);
@@ -538,9 +564,11 @@ export function OutcomeChip({
     skipped: "bg-slate-100 text-slate-700 border-slate-200",
     running: "bg-slate-50 text-slate-700 border-slate-200",
     pending: "",
+    unreachable: "bg-amber-50 text-amber-800 border-amber-200",
   };
   const label: Record<Outcome["summary"], string> = {
     sent: "Sent", failed: "Failed", skipped: "Skipped", running: "Sending…", pending: "",
+    unreachable: "Kestra unreachable",
   };
 
   async function toggleLogs() {
