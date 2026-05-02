@@ -1,13 +1,21 @@
 import { NextResponse } from "next/server";
 import { chat } from "@/lib/playbook";
+import { requireAuth, authErrorResponse } from "@/lib/pulsar-auth";
 
 export const dynamic = "force-dynamic";
 
 export async function POST(req: Request) {
-  const { workspaceSlug, message, context } = await req.json();
+  let slug: string;
+  try {
+    ({ slug } = requireAuth(req));
+  } catch (e) {
+    return authErrorResponse(e);
+  }
 
-  if (!workspaceSlug || !message) {
-    return NextResponse.json({ error: "workspaceSlug and message required" }, { status: 400 });
+  const { message, context } = await req.json();
+
+  if (!message) {
+    return NextResponse.json({ error: "message required" }, { status: 400 });
   }
 
   // Build system prompt with context if provided
@@ -17,7 +25,7 @@ export async function POST(req: Request) {
   }
 
   try {
-    const response = await chat(workspaceSlug, message, systemPrompt);
+    const response = await chat(slug, message, systemPrompt);
     return NextResponse.json({
       answer: response.textResponse,
       sources: response.sources || [],

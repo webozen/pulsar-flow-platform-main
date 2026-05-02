@@ -159,6 +159,26 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: 'name and triggerSql are required' }, { status: 400 })
     }
 
+    // Fix 3: Validate triggerSql is read-only (same rules as /api/triggers/test)
+    const upperSql = (data.triggerSql as string).trim().toUpperCase()
+    if (!upperSql.startsWith('SELECT')) {
+      return NextResponse.json({ error: 'Query must start with SELECT' }, { status: 400 })
+    }
+    for (const kw of ['INSERT', 'UPDATE', 'DELETE', 'DROP', 'ALTER', 'TRUNCATE']) {
+      if (new RegExp(`(?<![A-Z])${kw}(?![A-Z])`).test(upperSql)) {
+        return NextResponse.json({ error: `Query must not contain ${kw}` }, { status: 400 })
+      }
+    }
+
+    // Fix 2: Reject duplicate name within the same clinic/namespace
+    const existing = await queryOne(
+      'SELECT id FROM flowcore.workflows WHERE clinic_id = $1 AND name = $2',
+      [slug, data.name],
+    )
+    if (existing) {
+      return NextResponse.json({ error: 'A workflow with this name already exists' }, { status: 409 })
+    }
+
     // Plan B: clinic_id stores the slug as opaque text (FK to flowcore.clinics
     // dropped). This is the only DB row we keep — needed because the builder
     // UI's structured action list can't be losslessly reconstructed from the
@@ -174,6 +194,7 @@ export async function POST(req: Request) {
       ]
     )
 
+    // Fix 1: If Kestra deploy fails, delete the DB row to avoid desync
     const wf = workflow as Record<string, unknown>
     try {
       const workflowDef = {
@@ -188,14 +209,16 @@ export async function POST(req: Request) {
       }
       const { parent, worker } = generateKestraYaml(workflowDef, { pair: true })
       const workerFlow = await createOrUpdateFlowFromYaml(worker)
-      let primaryFlowId = workerFlow?.id
+      if (!workerFlow?.id) throw new Error('Kestra returned no flow id')
+      let primaryFlowId = workerFlow.id
       if (parent) {
         const parentFlow = await createOrUpdateFlowFromYaml(parent)
         primaryFlowId = parentFlow?.id || primaryFlowId
       }
-      await query('UPDATE flowcore.workflows SET kestra_flow_id = $1 WHERE id = $2', [primaryFlowId || data.name, wf.id])
+      await query('UPDATE flowcore.workflows SET kestra_flow_id = $1 WHERE id = $2', [primaryFlowId, wf.id])
     } catch (err) {
-      console.error('Kestra deploy failed:', err)
+      await query('DELETE FROM flowcore.workflows WHERE id = $1', [wf.id])
+      return NextResponse.json({ error: `Workflow deploy failed: ${err}` }, { status: 502 })
     }
 
     return NextResponse.json(workflow, { status: 201 })
