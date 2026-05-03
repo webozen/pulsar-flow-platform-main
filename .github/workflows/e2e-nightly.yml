@@ -196,12 +196,17 @@ jobs:
             -d '{"slug":"acme-dental","name":"Acme Dental","modules":["automation"],"contactEmail":"ci@acme.test"}' \
             | jq .
 
+      # URLs use 127.0.0.1 (not `localhost`) because Node 17+ resolves
+      # `localhost` to IPv6 ::1 first, and the backend container started
+      # via `docker run --network host` on a Linux runner only binds to
+      # IPv4. Without this, Playwright fails with `ECONNREFUSED ::1:18080`
+      # even though curl from the same step connects fine (curl prefers IPv4).
       - name: Run Playwright (default — sends 1 SMS in the no-crosstalk test)
         if: ${{ inputs.run_live_twilio != 'true' }}
         env:
-          PULSAR_BACKEND_URL: http://localhost:18080
-          PULSAR_FLOW_APP_URL: http://localhost:3002
-          KESTRA_URL: http://localhost:8080
+          PULSAR_BACKEND_URL: http://127.0.0.1:18080
+          PULSAR_FLOW_APP_URL: http://127.0.0.1:3002
+          KESTRA_URL: http://127.0.0.1:8080
           PULSAR_ADMIN_PASSCODE: PULS-DEV-0000
           TEST_TENANT_SLUG: acme-dental
         run: npx playwright test approvals.spec.ts --workers=1
@@ -209,9 +214,9 @@ jobs:
       - name: Run Playwright (with live Twilio delivery confirmation)
         if: ${{ inputs.run_live_twilio == 'true' }}
         env:
-          PULSAR_BACKEND_URL: http://localhost:18080
-          PULSAR_FLOW_APP_URL: http://localhost:3002
-          KESTRA_URL: http://localhost:8080
+          PULSAR_BACKEND_URL: http://127.0.0.1:18080
+          PULSAR_FLOW_APP_URL: http://127.0.0.1:3002
+          KESTRA_URL: http://127.0.0.1:8080
           PULSAR_ADMIN_PASSCODE: PULS-DEV-0000
           TEST_TENANT_SLUG: acme-dental
           RUN_LIVE_TWILIO: "1"
