@@ -23,9 +23,16 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Validate YAML syntax
+        # `kestra/flows/dental/*.yml` no longer exists — workflows are
+        # generated dynamically by the Next.js orchestrator at deploy time
+        # (see app/src/lib/workflow-generator.ts). Validate only the static
+        # YAML that does live in this repo: the Kestra application config
+        # and the per-clinic namespace templates.
         run: |
           pip install pyyaml --quiet
-          for f in kestra/flows/**/*.yml kestra/namespace-configs/*.yml kestra/application.yml; do
+          shopt -s nullglob
+          for f in kestra/namespace-configs/*.yml kestra/application.yml; do
+            [ -f "$f" ] || continue
             echo "Validating $f..."
             python3 -c "import yaml; yaml.safe_load(open('$f'))" || exit 1
           done

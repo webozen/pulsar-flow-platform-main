@@ -1,6 +1,6 @@
 ---
 status: stable
-last-reviewed: 2026-04-25
+last-reviewed: 2026-05-02
 ---
 # System Overview
 
@@ -135,7 +135,7 @@ The canonical journey — from a cron firing to a patient's phone ringing.
 ```
 
 > [!important] Subflow-per-row (vs. one-execution-many-Pauses)
-> Kestra OSS 0.19.11 ignores `taskRunId` on `POST /executions/{id}/resume` — it resumes whichever paused gate is next in the FIFO queue. Approving "Sawyer" would send Ivanna's SMS. The fix is **architectural**: each row is its own execution with exactly one paused gate, so resuming the *execution* is unambiguous. See `apt-reminder-demo.yml` (parent fan-out) and `apt-reminder-row.yml` (child).
+> Kestra OSS 0.19.11 ignores `taskRunId` on `POST /executions/{id}/resume` — it resumes whichever paused gate is next in the FIFO queue. Approving "Sawyer" would send Ivanna's SMS. The fix is **architectural**: each row is its own execution with exactly one paused gate, so resuming the *execution* is unambiguous. The orchestrator's `app/src/lib/workflow-generator.ts` always emits a parent flow (`{flowId}`, fans out via ForEach) plus a worker subflow (`{flowId}-run`, exactly one row, optional Pause). See the comment header at the top of that file for the full rationale.
 
 ## 3 · Multi-Tenancy
 
@@ -176,8 +176,8 @@ Three identifiers, deterministically derived from one.
 
 1. Admin POSTs to `pulsar-backend` `/api/admin/tenants` with slug, name, modules
 2. `TenantProvisioningService` creates `pulsar_t_<slug>` MySQL DB, runs Flyway for each active module
-3. `automation-sync` module observes the `TenantCreated` event, POSTs the tenant payload to flow-platform `/automation/api/tenants/sync`
-4. Flow-platform creates Kestra namespace `dental.<slug>`, deploys all `kestra/flows/dental/*.yml` (with namespace rewritten), seeds KV defaults
+3. `automation-sync` module observes the `TenantCreated` event, POSTs the tenant payload to the orchestrator at `/api/automation/tenant-sync/*` (signed with `PULSAR_AUTOMATION_SYNC_SECRET`)
+4. Orchestrator creates Kestra namespace `dental.<slug>`, writes the `flowcore.clinics` row, and seeds namespace KV defaults. Workflow YAML is generated and `PUT` to Kestra **only when the operator deploys a workflow from the UI** (or chooses one of the templates in `app/src/lib/workflow-templates.ts`) — there are no static dental flow files staged on disk.
 
 ## Tech Stack Summary
 

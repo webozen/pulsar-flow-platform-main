@@ -1,76 +1,81 @@
 ---
 status: stable
+last-reviewed: 2026-05-02
 ---
 # Execution Flow
 
-> End-to-end: Kestra trigger → dedup check → actions → pause/resume → re-validate → escalate.
+> End-to-end: scheduled trigger → HTTP query → ForEach → per-row worker → optional pause → resume → action(s).
+
+This page describes what happens **inside Kestra** for a single row. For the cross-system flow (UI click → resume → Twilio), see [[System Overview]] §2.
 
 ## Sequence
 
 ```mermaid
 sequenceDiagram
-    participant OD as Open Dental MySQL
-    participant K as Kestra Engine
+    participant K as Kestra (parent flow)
+    participant W as Kestra (worker subflow)
+    participant OD as Open Dental API
     participant T as Twilio (SMS)
     participant M as SMTP (Email)
-    participant UI as Kestra UI (Human)
+    participant U as Approvals UI (Human)
 
-    Note over K: Trigger fires (JDBC poll or cron)
-    K->>OD: SELECT overdue recalls / appointments / claims
-    OD-->>K: Result rows
+    Note over K: Trigger fires (cron)
+    K->>OD: PUT /queries/ShortQuery (read-only SQL)
+    OD-->>K: JSON rows
+    Note over K: ForEach rows → spawn one worker per row<br/>Parent finishes (wait: false)
 
-    K->>OD: Check dental_automation_log (dedup)
-    OD-->>K: count = 0 (new)
+    W->>W: inputs.record = JSON-stringified row
 
-    alt SMS available
-        K->>T: POST /Messages.json
-        T-->>K: 201 Created
+    alt Has approval gate (claims-followup, etc.)
+        W-->>U: PAUSED (visible in /approvals)
+        U->>W: Resume (Pulsar UI → /api/approvals/{id}/resume)
     end
 
-    K->>OD: INSERT into dental_automation_log
-
-    alt Has approval gate (claims-followup)
-        K->>UI: Pause execution (await human)
-        UI-->>K: Resume (billing team approves)
-        K->>OD: Re-check claim status (re-validate)
+    alt Has scheduled delay (recall/treatment/appointment)
+        Note over W: Pause P3D / P1D / P7D<br/>Kestra persists state
+        W->>OD: Re-query patient status (re-validation)
     end
 
-    alt Has delay (recall/appointment/treatment)
-        Note over K: Pause P3D / P1D / P7D
-        K->>OD: Re-query patient status
-        alt Still needs action
-            K->>M: Send follow-up email
-            K->>OD: Log escalation
-        end
+    alt Should act
+        W->>T: POST Twilio Messages API
+        T-->>W: 201 Created
     end
+
+    alt Has email step
+        W->>M: SMTP send
+        M-->>W: ack
+    end
+
+    Note over W: Execution → SUCCESS<br/>Visible in portal history
 ```
 
 ## Key invariants
 
-1. **Dedup first.** Every flow checks `dental_automation_log` before acting. A patient won't receive duplicate outreach within the configured window.
+1. **One execution per row.** The parent flow fans out via `ForEach`; each row is its own worker execution. This makes Approve/Reject in the UI unambiguous (Kestra OSS 0.19.x ignores `taskRunId` on resume — see [[System Overview]] §2).
 
-2. **Re-validate after pause.** After any delay or human approval, the flow re-queries Open Dental to check if the situation resolved. This prevents stale actions.
+2. **Re-validate after pause.** After any delay or human approval, the worker re-queries the data source to check if the situation resolved (e.g., the patient already booked, the claim was paid). This prevents stale actions.
 
-3. **Namespace isolation.** Each clinic runs in its own Kestra namespace with separate KV variables, secrets, and execution history.
+3. **Namespace isolation.** Each clinic runs in its own Kestra namespace (`dental.<slug>`) with separate KV variables, secrets, and execution history. See [[Tenant Isolation]].
 
-4. **At-least-once semantics.** The dedup table mitigates duplicate sends on engine restart.
+4. **At-least-once semantics.** Workflow templates that need stronger dedup pair the action with a per-clinic `dental_automation_log` lookup (see [[Correlation Key]]).
 
 ## Trigger types
 
-| Trigger | Flows | Interval |
-|---------|-------|----------|
-| JDBC MySQL poll | recall-reminder, claims-followup, treatment-followup | PT5M to P1D |
-| Cron schedule | appointment-reminder | 7am daily |
+| Trigger | When to use | Notes |
+|---------|------------|-------|
+| `io.kestra.plugin.core.trigger.Schedule` (cron) | Default for every generated workflow | The orchestrator fills in cron from `flowcore.workflows.triggerCron`. |
+| `io.kestra.plugin.core.trigger.Webhook` | Manual / event-driven workflows | Used when `actionMode = manual`. |
+
+JDBC polling triggers are not used — per [[ADR-009 Open Dental API over Direct MySQL]], data-source reads happen as HTTP requests inside the parent flow, not as the trigger itself.
 
 ## Task types used
 
 | Kestra Task | Purpose |
 |-------------|---------|
-| `io.kestra.plugin.jdbc.mysql.Trigger` | Poll Open Dental tables |
-| `io.kestra.plugin.jdbc.mysql.Query` | Dedup check, re-validation, audit log insert |
-| `io.kestra.plugin.core.http.Request` | Twilio SMS API |
+| `io.kestra.plugin.core.http.Request` | Open Dental ShortQuery API; Twilio Messages API |
 | `io.kestra.plugin.notifications.mail.MailSend` | Email via SMTP |
-| `io.kestra.plugin.core.flow.Pause` | Delay (with duration) or human approval (no duration) |
-| `io.kestra.plugin.core.flow.If` | Conditional branching |
+| `io.kestra.plugin.core.flow.Pause` | Delay (with `delay`) or human approval (no `delay`) |
+| `io.kestra.plugin.core.flow.If` | Conditional branching (e.g., "if email present") |
 | `io.kestra.plugin.core.flow.Switch` | Multi-way branching |
-| `io.kestra.plugin.core.flow.ForEach` | Iterate over query result rows |
+| `io.kestra.plugin.core.flow.ForEach` | Iterate over query result rows in the parent |
+| `io.kestra.plugin.core.flow.Subflow` | Spawn the per-row worker execution |
