@@ -109,6 +109,18 @@ jobs:
       - run: npx playwright install --with-deps chromium
 
       - name: Build & start Next.js app
+        # Env block is required at BOTH build and start: `next build`'s
+        # page-data collection evaluates server modules in production
+        # mode, and `app/src/lib/{kestra,opendental}.ts` resolve their
+        # URLs through `requireEnv` which throws when NODE_ENV=production
+        # and the var is unset (the dev defaults are intentionally
+        # ignored in prod — see app/src/lib/env.ts).
+        env:
+          KESTRA_API_URL: http://localhost:8080
+          OPENDENTAL_API_BASE: https://api.opendental.com/api/v1
+          PULSAR_JWT_SECRET: dev-secret-change-me-please-32bytes-minimum-abcdefgh
+          PULSAR_AUTOMATION_SYNC_SECRET: dev-sync-secret
+          PULSAR_BACKEND_URL: http://localhost:18080
         run: |
           npm run build
           nohup npm run start -- -p 3002 >/tmp/app.log 2>&1 &
