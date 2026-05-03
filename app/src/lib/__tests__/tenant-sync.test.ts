@@ -63,19 +63,12 @@ describe("FLOWS_BY_MODULE", () => {
     }
   });
 
-  it("every flow listed in FLOWS_BY_MODULE corresponds to a YAML on disk", async () => {
-    // Reverse-direction guard: pinning the LIST is brittle if someone
-    // renames a YAML and forgets to update the map. Read the shipped
-    // flows directory and assert every value in the map is present.
-    delete process.env.PULSAR_FLOWS_DIR; // use the default kestra/flows/dental
-    const { FLOWS_BY_MODULE, loadDentalFlows } = await importFresh();
-    const onDisk = new Set(loadDentalFlows("test-tenant").map((f) => f.id));
-    const allMapped = new Set<string>();
-    for (const flows of Object.values(FLOWS_BY_MODULE)) flows.forEach((f) => allMapped.add(f));
-    for (const id of allMapped) {
-      expect(onDisk, `flow id "${id}" mapped in FLOWS_BY_MODULE but no .yml found in kestra/flows/dental/`).toContain(id);
-    }
-  });
+  // The "every flow listed in FLOWS_BY_MODULE corresponds to a YAML on disk"
+  // test was removed: there are no shipped YAML files in `kestra/flows/dental/`
+  // anymore (workflows are generated dynamically by app/src/lib/workflow-generator.ts).
+  // The "automation bucket is empty by design" test above is the surviving
+  // invariant — it pins that no module activates a code-shipped flow, which is
+  // the contract the orchestrator now relies on.
 });
 
 describe("loadDentalFlows", () => {
