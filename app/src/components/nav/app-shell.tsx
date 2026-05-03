@@ -1,127 +1,174 @@
 'use client'
 
-import Link from 'next/link'
+import { useEffect, useState } from 'react'
 import { usePathname } from 'next/navigation'
-import { Button } from '@/components/ui/button'
 import { useBranding } from '@/lib/use-branding'
+import { clientFetch } from '@/lib/client-fetch'
 
-// `Conversations` was a multi-clinic chat thread browser keyed by phone
-// number, populated from `flowcore.sms_messages` / `flowcore.voice_calls`.
-// Those tables aren't being written under Plan B yet, so the page would be
-// empty. Hidden from nav until the per-tenant MySQL message tables ship.
-const links = [
-  { href: '/dashboard', label: 'Dashboard', icon: 'M3 12l2-2m0 0l7-7 7 7M5 10v10a1 1 0 001 1h3m10-11l2 2m-2-2v10a1 1 0 01-1 1h-3m-6 0a1 1 0 001-1v-4a1 1 0 011-1h2a1 1 0 011 1v4a1 1 0 001 1m-6 0h6' },
-  // `/workflows` is a tenant-scoped redirect → `/clinics/<slug>/workflows`
-  // (existing slug-keyed page). Adding it to the nav so a tenant user has
-  // a single click to their workflows from anywhere in the app.
-  { href: '/workflows', label: 'Workflows', icon: 'M13 10V3L4 14h7v7l9-11h-7z' },
-  { href: '/approvals', label: 'Approvals', icon: 'M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z' },
-]
+/**
+ * Top chrome — mirrors `pulsar-frontend/apps/web/src/shells/TenantShell.tsx`
+ * so the user doesn't visually leave Pulsar when they cross into the
+ * orchestrator. Two rows:
+ *
+ *   Row 1 (header): Pulsar logo + appName (left)  ·  module switcher
+ *                   (Content / Automation* / Translate / Ask AI / OpenDental) +
+ *                   gear ⚙ + Sign out (right). The non-Automation tabs
+ *                   deep-link back to `pulsarBase/t/<slug>/<modulePath>`.
+ *
+ *   Row 2 (sub-nav): Dashboard / Workflows / Approvals — the orchestrator's
+ *                    own internal sections, kept off the top header so the
+ *                    chrome stays single-row like the tenant shell.
+ *
+ * The slug for back-links comes from `/clinics/<slug>/...` URLs; pages
+ * outside that scope (Dashboard, Approvals) fall back to the Pulsar root,
+ * which HomeRedirect bounces to the user's tenant.
+ */
 
-function NavIcon({ d }: { d: string }) {
-  return (
-    <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
-      <path strokeLinecap="round" strokeLinejoin="round" d={d} />
-    </svg>
-  )
-}
+// Module switcher — static dental-domain list mirroring
+// pulsar-frontend's `moduleRegistry.ts`. Kept hardcoded to avoid a
+// cross-repo import; if the tenant has a module deactivated, the link
+// still resolves through Pulsar's TenantShell which only renders
+// active ones.
+const MODULES = [
+  { id: 'content',             label: 'Content',     path: '/content' },
+  { id: 'automation',          label: 'Automation',  path: '/automation', current: true },
+  { id: 'translate',           label: 'Translate',   path: '/translate' },
+  { id: 'opendental-ai',       label: 'Ask AI',      path: '/opendental-ai' },
+  { id: 'opendental-calendar', label: 'OpenDental',  path: '/opendental-calendar' },
+] as const
 
-export function AppShell({ children, userName }: { children: React.ReactNode; userName?: string | null }) {
+export function AppShell({ children, userName: _userName }: { children: React.ReactNode; userName?: string | null }) {
   const pathname = usePathname()
   const pulsarBase = process.env.NEXT_PUBLIC_PULSAR_APP_URL || 'http://localhost:5173'
   const branding = useBranding()
 
-  // Deep-link "Back to Pulsar" to the tenant home so the user lands inside
-  // their already-authenticated tenant shell instead of bouncing through
-  // the unauthenticated `/` → `/login` redirect. Slug comes from the URL —
-  // every page under /clinics/<slug>/ has it; routes without a slug fall
-  // back to the root and rely on Pulsar's HomeRedirect to land them.
+  // Slug comes from /clinics/<slug>/... URLs when present; on the
+  // tenant-global pages (/dashboard, /approvals) the URL doesn't carry
+  // it, so fall back to the JWT-derived slug from /api/auth/me. Cached
+  // in component state so the breadcrumb appears as soon as the fetch
+  // resolves and stays consistent across nav clicks.
   const slugMatch = pathname.match(/^\/clinics\/([^/]+)/)
-  const slug = slugMatch ? slugMatch[1] : null
-  const pulsarUrl = slug ? `${pulsarBase}/t/${slug}` : pulsarBase
+  const [meSlug, setMeSlug] = useState<string | null>(null)
+  useEffect(() => {
+    if (slugMatch) return
+    let cancelled = false
+    // clientFetch prepends `/automation` so the request goes through
+    // Vite's /automation/* proxy → Next.js /api/auth/me. A bare fetch
+    // would hit `localhost:5173/api/auth/me`, which Vite proxies to
+    // Spring (port 18080), where this endpoint doesn't exist.
+    clientFetch('/api/auth/me')
+      .then(r => (r.ok ? r.json() : null))
+      .then(d => { if (!cancelled && d?.slug) setMeSlug(d.slug) })
+      .catch(() => {})
+    return () => { cancelled = true }
+  }, [pathname]) // eslint-disable-line react-hooks/exhaustive-deps
+  const slug = slugMatch ? slugMatch[1] : meSlug
 
-  // Branded chrome — logo + app name fall back to the legacy "Pulsar
-  // Flow" treatment when the branding endpoint isn't reachable. The
-  // active-tab background uses the tenant primary color (CSS var
-  // `--pulsar-primary` is set by useBranding) so each clinic feels
-  // distinct from the others.
-  const appName = branding?.appName ?? 'Pulsar Flow'
-  // Default to sky-500 (#0EA5E9) — matches the design.md `accent` token
-  // in pulsar-frontend so all three apps read as one product. Tenants
-  // can still override via branding.primaryColor.
-  const primary = branding?.primaryColor ?? '#0EA5E9'
+  const appName = branding?.appName ?? 'Pulsar'
+  // Tenant brand override or default to the Pulsar accent (#0EA5E9 — same
+  // as `--p-accent` in pulsar-frontend's tokens.css).
+  const primary = branding?.primaryColor ?? 'var(--p-accent)'
+
+  // Where to send each module switcher tab. Automation stays in this app;
+  // everything else goes back to the Pulsar React shell.
+  function moduleHref(m: (typeof MODULES)[number]): string {
+    if (m.id === 'automation') return '/automation'
+    return slug ? `${pulsarBase}/t/${slug}${m.path}` : pulsarBase
+  }
+  function settingsHref(): string {
+    return slug ? `${pulsarBase}/t/${slug}/settings` : `${pulsarBase}/login`
+  }
 
   return (
-    <div className="flex min-h-screen flex-col" style={{ backgroundColor: '#FDFAF6' }}>
-      <header className="sticky top-0 z-50 border-b border-gray-200 bg-white">
-        <div className="mx-auto flex h-14 max-w-7xl items-center justify-between px-4 sm:px-6">
-          <div className="flex items-center gap-8">
-            <div className="flex items-center gap-2.5">
-              {branding?.logoUrl ? (
-                // eslint-disable-next-line @next/next/no-img-element
-                <img
-                  src={branding.logoUrl}
-                  alt={appName}
-                  className="h-8 w-8 rounded-lg object-contain"
-                  onError={(e) => { (e.currentTarget as HTMLImageElement).style.display = 'none' }}
-                />
-              ) : (
-                <div
-                  className="flex h-8 w-8 items-center justify-center rounded-lg text-white text-sm font-bold"
-                  style={{ backgroundColor: primary }}
+    <div className="flex min-h-screen flex-col bg-[var(--p-canvas)]">
+      {/* Single-row chrome — same h-14 as TenantShell, full-width (no
+          max-w container) so the wordmark/nav sit flush at the edges
+          and the perceived header size matches the other modules. */}
+      <header
+        className="sticky top-0 z-50 h-14 border-b px-6 flex items-center justify-between bg-[var(--p-surface)]"
+        style={{ borderColor: 'var(--p-border)' }}
+      >
+        {/* Left: logo + app name + slug breadcrumb. Mirrors TenantShell
+            — clicking the wordmark goes to the tenant's Pulsar home
+            (cross-app full page nav, NOT the orchestrator's /dashboard).
+            The slug appears as a slate-colored breadcrumb after the
+            wordmark so the clinic context is visible on every page;
+            suppressed when it duplicates the displayed brand name (a
+            tenant with `branding.appName = "Acme Dental"` shouldn't
+            then also see "· acme" appended). */}
+        <a
+          href={slug ? `${pulsarBase}/t/${slug}` : pulsarBase}
+          className="flex items-center gap-2.5"
+        >
+          {branding?.logoUrl ? (
+            // eslint-disable-next-line @next/next/no-img-element
+            <img
+              src={branding.logoUrl}
+              alt={appName}
+              className="h-7 w-auto rounded object-contain"
+              onError={(e) => { (e.currentTarget as HTMLImageElement).style.display = 'none' }}
+            />
+          ) : null}
+          <span className="text-base font-semibold" style={{ color: 'var(--p-ink)' }}>{appName}</span>
+          {slug && slug.toLowerCase() !== appName.toLowerCase() && (
+            <>
+              <span className="text-base" style={{ color: 'var(--p-mute)' }}>·</span>
+              <span className="text-base font-medium" style={{ color: 'var(--p-slate)' }}>{slug}</span>
+            </>
+          )}
+        </a>
+
+        {/* Right: module switcher + gear + sign out */}
+        <nav className="flex items-center gap-1 text-sm">
+          {MODULES.map(m => {
+            const isActive = m.id === 'automation'
+            const baseClass = 'px-3 py-1.5 rounded-md text-sm font-medium transition-colors'
+            if (isActive) {
+              return (
+                <span
+                  key={m.id}
+                  className={baseClass}
+                  style={{ backgroundColor: 'var(--p-accent-soft)', color: primary }}
                 >
-                  {appName.charAt(0).toUpperCase()}
-                </div>
-              )}
-              <span className="text-base font-bold text-gray-900">{appName}</span>
-            </div>
-            <nav className="hidden sm:flex items-center border-l border-gray-200 pl-8 gap-1">
-              {links.map((link) => {
-                const active = pathname.startsWith(link.href)
-                return (
-                  <Link key={link.href} href={link.href}
-                    className={`flex items-center gap-2 rounded-lg px-3 py-2 text-sm font-medium transition-colors ${
-                      active ? 'border' : 'text-gray-500 hover:text-gray-900 hover:bg-gray-100'
-                    }`}
-                    style={
-                      active
-                        ? {
-                            // Tinted active tab using the tenant brand color.
-                            backgroundColor: `${primary}14`, // ~8% alpha
-                            color: primary,
-                            borderColor: `${primary}33`, // ~20% alpha
-                          }
-                        : undefined
-                    }
-                  >
-                    <NavIcon d={link.icon} />
-                    {link.label}
-                  </Link>
-                )
-              })}
-            </nav>
-          </div>
-          <div className="flex items-center gap-3">
-            {userName && (
-              <div className="hidden sm:flex items-center gap-2">
-                <div className="h-7 w-7 rounded-full flex items-center justify-center text-xs font-semibold" style={{ backgroundColor: '#E0F2FE', color: '#0284C7' }}>
-                  {userName.charAt(0).toUpperCase()}
-                </div>
-                <span className="text-sm font-medium text-gray-700">{userName}</span>
-              </div>
-            )}
-            <div className="border-l border-gray-200 pl-3">
-              <a href={pulsarUrl}>
-                <Button variant="ghost" size="sm" className="text-gray-500 hover:text-gray-900 text-sm">
-                  ← Back to Pulsar
-                </Button>
+                  {m.label}
+                </span>
+              )
+            }
+            return (
+              <a
+                key={m.id}
+                href={moduleHref(m)}
+                className={`${baseClass} hover:bg-[var(--p-surface-2)]`}
+                style={{ color: 'var(--p-slate)' }}
+              >
+                {m.label}
               </a>
-            </div>
-          </div>
-        </div>
+            )
+          })}
+          <a
+            href={settingsHref()}
+            title="Settings"
+            aria-label="Settings"
+            className="ml-2 p-1.5 rounded-md hover:bg-[var(--p-surface-2)] transition-colors"
+            style={{ color: 'var(--p-slate)' }}
+          >
+            <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.6}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
+              <path strokeLinecap="round" strokeLinejoin="round" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
+            </svg>
+          </a>
+          <a
+            href={`${pulsarBase}/login`}
+            className="ml-2 px-3 py-1.5 rounded-md hover:bg-[var(--p-surface-2)] transition-colors text-sm"
+            style={{ color: 'var(--p-slate)' }}
+          >
+            Sign out
+          </a>
+        </nav>
       </header>
+
       <main className="flex-1">
-        <div className="mx-auto max-w-7xl px-4 sm:px-6 py-8">{children}</div>
+        <div className="mx-auto max-w-7xl px-4 sm:px-6 py-5">{children}</div>
       </main>
     </div>
   )

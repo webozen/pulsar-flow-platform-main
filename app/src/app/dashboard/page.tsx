@@ -7,6 +7,7 @@ import { validateToken } from "@/lib/pulsar-auth";
 import { KESTRA_URL } from "@/lib/kestra";
 import { namespaceFor } from "@/lib/tenant-sync";
 import { timeAgo, fullTimestamp } from "@/lib/time-ago";
+import { AutomationFrame } from "@/components/nav/automation-frame";
 import Link from "next/link";
 
 export const dynamic = "force-dynamic";
@@ -107,11 +108,11 @@ export default async function DashboardPage() {
   const { workflowCount, execStats, recentExecutions, workflowCounts } = await getStats(slug);
 
   return (
-    <div className="space-y-8">
-      <div>
-        <h1 className="text-2xl font-bold tracking-tight text-slate-900">Dashboard</h1>
-        <p className="text-[13px] text-slate-500 mt-1">Pulsar Flow — {slug}</p>
-      </div>
+    <AutomationFrame active="dashboard">
+      <div className="space-y-5">
+      {/* Page-level title removed — AutomationFrame already provides
+          "⚡ Automation" + tagline + tab strip; an inner Dashboard h1
+          would duplicate hierarchy. Slug context is implicit per JWT. */}
 
       {/* Stats row — JWT-scoped to this tenant only. */}
       <div className="grid gap-4 sm:grid-cols-3">
@@ -120,7 +121,7 @@ export default async function DashboardPage() {
         <StatCard title="Failed Runs" value={execStats.failed} color="red" />
       </div>
 
-      <div className="grid gap-6 lg:grid-cols-2">
+      <div className="grid gap-4 lg:grid-cols-2">
         {/* Per-workflow breakdown */}
         <Card>
           <CardHeader className="pb-3">
@@ -128,7 +129,7 @@ export default async function DashboardPage() {
           </CardHeader>
           <CardContent>
             {Object.keys(workflowCounts).length === 0 ? (
-              <div className="flex flex-col items-center py-8 text-center">
+              <div className="flex flex-col items-center py-5 text-center">
                 <div className="rounded-full bg-gray-100 p-3 mb-3">
                   <svg className="h-6 w-6 text-gray-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
                     <path strokeLinecap="round" strokeLinejoin="round" d="M3.75 13.5l10.5-11.25L12 10.5h8.25L9.75 21.75 12 13.5H3.75z" />
@@ -161,14 +162,14 @@ export default async function DashboardPage() {
           </CardHeader>
           <CardContent>
             {recentExecutions.length === 0 ? (
-              <div className="flex flex-col items-center py-8 text-center">
+              <div className="flex flex-col items-center py-5 text-center">
                 <div className="rounded-full bg-gray-100 p-3 mb-3">
                   <svg className="h-6 w-6 text-gray-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
                     <path strokeLinecap="round" strokeLinejoin="round" d="M12 6v6h4.5m4.5 0a9 9 0 11-18 0 9 9 0 0118 0z" />
                   </svg>
                 </div>
                 <p className="text-sm text-muted-foreground">No executions yet.</p>
-                <Link href="/clinics" className="text-xs text-blue-600 hover:underline mt-1">Add a clinic to get started</Link>
+                <Link href="/clinics" className="text-xs hover:underline mt-1" style={{ color: 'var(--p-accent)' }}>Add a clinic to get started</Link>
               </div>
             ) : (
               <div className="space-y-2">
@@ -193,29 +194,29 @@ export default async function DashboardPage() {
           </CardContent>
         </Card>
       </div>
-    </div>
+      </div>
+    </AutomationFrame>
   );
 }
 
 function StatCard({ title, value, href, color }: { title: string; value: number; href?: string; color: string }) {
-  const borderColor: Record<string, string> = {
-    blue: "border-l-blue-500",
-    violet: "border-l-violet-500",
-    amber: "border-l-amber-500",
-    red: "border-l-red-500",
-  };
+  // Per pulsar-frontend/design.md: ONE accent — all stat cards read
+  // uniformly. The five-competing-accents pattern (blue/violet/amber/red
+  // left-borders) bypassed the design system. Status colors now apply
+  // ONLY when the value indicates a problem state (failed > 0, pending
+  // > 0), and only on the value text — not the card chrome.
   const valueColor: Record<string, string> = {
-    blue: "text-slate-900",
+    blue:   "text-slate-900",
     violet: "text-slate-900",
-    amber: "text-amber-600",
-    red: "text-red-600",
+    amber:  value > 0 ? "text-amber-600" : "text-slate-900",
+    red:    value > 0 ? "text-red-600"   : "text-slate-900",
   };
 
   const content = (
-    <Card className={`transition-shadow border-l-4 ${borderColor[color] || ""} ${href ? "hover:shadow-md cursor-pointer" : ""}`}>
-      <CardContent className="pt-5 pb-4">
+    <Card className={`transition-shadow ${href ? "hover:shadow-md cursor-pointer" : ""}`}>
+      <CardContent className="pt-4 pb-3">
         <p className="text-xs font-medium text-slate-500 uppercase tracking-wider">{title}</p>
-        <p className={`text-3xl font-bold mt-1 ${valueColor[color] || ""}`}>{value}</p>
+        <p className={`text-2xl font-bold mt-1 ${valueColor[color] || "text-slate-900"}`}>{value}</p>
       </CardContent>
     </Card>
   );

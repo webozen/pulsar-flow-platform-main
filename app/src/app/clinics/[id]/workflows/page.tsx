@@ -11,6 +11,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Input } from "@/components/ui/input";
 import { Skeleton } from "@/components/ui/skeleton";
 import { timeAgo, fullTimestamp } from "@/lib/time-ago";
+import { AutomationFrame } from "@/components/nav/automation-frame";
 import { RefreshCw } from "lucide-react";
 
 // ── Types ──────────────────────────────────────────────────────
@@ -59,8 +60,9 @@ export default function WorkflowsPage() {
   const { id: clinicId } = useParams();
   const router = useRouter();
   const slugFromUrl = String(clinicId ?? "");
-  const [clinicName, setClinicName] = useState(slugFromUrl);
-  const [clinicSlug, setClinicSlug] = useState(slugFromUrl);
+  // clinicName / clinicSlug were used by the old clinic-avatar header
+  // that the AutomationFrame replaces; only the namespace is still needed
+  // (passed to AuditTab for Kestra calls).
   const [clinicNamespace, setClinicNamespace] = useState(slugFromUrl ? `dental.${slugFromUrl}` : "");
 
   // Guard against stale URLs: bookmarks or browser history from before the
@@ -82,33 +84,17 @@ export default function WorkflowsPage() {
     clientFetch(`/api/clinics/${clinicId}`).then(async (r) => {
       if (r.ok) {
         const c = await r.json();
-        if (c?.name) setClinicName(c.name);
-        if (c?.slug) setClinicSlug(c.slug);
         if (c?.kestra_namespace) setClinicNamespace(c.kestra_namespace);
       }
     });
   }, [clinicId]);
 
   return (
-    <div className="space-y-6">
-      {/* Clinic header */}
-      <div className="flex items-center justify-between">
-        <div className="flex items-center gap-4">
-          <div className="flex h-11 w-11 items-center justify-center rounded-xl bg-blue-600 text-white text-lg font-bold shadow-sm">
-            {clinicName.charAt(0).toUpperCase() || "?"}
-          </div>
-          <div>
-            <h1 className="text-xl font-bold tracking-tight">{clinicName || "Loading..."}</h1>
-            <p className="text-xs text-muted-foreground">{clinicNamespace}</p>
-          </div>
-        </div>
-        {/* Quick-links removed — Portal/Playbooks/Patient Log/Settings pages
-            still live in the legacy app/src/app/clinics/[id]/* tree but they
-            depend on flowcore.* tables we're phasing out (Plan B). Surface
-            them again once they're ported to slug-keyed routes against the
-            Kestra namespace. */}
-      </div>
-
+    <AutomationFrame active="workflows">
+      {/* Clinic-name avatar block was removed in the v1 chrome alignment —
+          clinic context is implicit from the URL slug. The sub-tabs below
+          (Workflows/Triggers/Reports/Audit Log) carry the operational
+          navigation that this page actually needs. */}
       <Tabs defaultValue="workflows">
         <TabsList className="bg-slate-100 p-1">
           <TabsTrigger value="workflows" className="data-[state=active]:bg-white data-[state=active]:shadow-sm data-[state=active]:text-slate-900">Workflows</TabsTrigger>
@@ -130,7 +116,7 @@ export default function WorkflowsPage() {
           <AuditTab namespace={clinicNamespace} />
         </TabsContent>
       </Tabs>
-    </div>
+    </AutomationFrame>
   );
 }
 
@@ -223,7 +209,13 @@ function WorkflowsTab({ clinicId }: { clinicId: string }) {
           </Button>
         </a>
         <Link href={`/clinics/${clinicId}/workflows/new`}>
-          <Button className="bg-blue-600 hover:bg-blue-700">
+          {/* Primary CTA — bound to the Pulsar `--p-accent` token, not the
+              raw `bg-blue-600` Tailwind class, so all CTAs across the
+              product share one accent color (design.md: one accent). */}
+          <Button
+            style={{ backgroundColor: 'var(--p-accent)', color: 'var(--p-accent-fg)' }}
+            className="hover:brightness-95"
+          >
             <svg className="mr-1.5 h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M12 4v16m8-8H4" /></svg>
             Create Workflow
           </Button>
@@ -232,16 +224,23 @@ function WorkflowsTab({ clinicId }: { clinicId: string }) {
 
       {workflows.length === 0 ? (
         <Card>
-          <CardContent className="flex flex-col items-center py-12 text-center">
-            <div className="rounded-full bg-blue-50 p-4 mb-4 ring-1 ring-blue-100">
-              <svg className="h-8 w-8 text-blue-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}><path strokeLinecap="round" strokeLinejoin="round" d="M3.75 13.5l10.5-11.25L12 10.5h8.25L9.75 21.75 12 13.5H3.75z" /></svg>
+          <CardContent className="flex flex-col items-center py-8 text-center">
+            <div
+              className="rounded-full p-4 mb-4 ring-1"
+              style={{ backgroundColor: 'var(--p-accent-soft)', boxShadow: 'inset 0 0 0 1px var(--p-accent-soft)' }}
+            >
+              <svg className="h-8 w-8" style={{ color: 'var(--p-accent)' }} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}><path strokeLinecap="round" strokeLinejoin="round" d="M3.75 13.5l10.5-11.25L12 10.5h8.25L9.75 21.75 12 13.5H3.75z" /></svg>
             </div>
             <h3 className="font-semibold text-lg">No workflows yet</h3>
             <p className="text-sm text-muted-foreground mt-1 mb-4 max-w-sm">
               Create your first automation, or trigger a platform-managed workflow from Kestra to populate this list.
             </p>
             <Link href={`/clinics/${clinicId}/workflows/new`}>
-              <Button size="sm">+ Create workflow</Button>
+              <Button
+                size="sm"
+                style={{ backgroundColor: 'var(--p-accent)', color: 'var(--p-accent-fg)' }}
+                className="hover:brightness-95"
+              >+ Create workflow</Button>
             </Link>
           </CardContent>
         </Card>

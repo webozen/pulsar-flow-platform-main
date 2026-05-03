@@ -9,6 +9,7 @@ import { Badge } from "@/components/ui/badge";
 import { Skeleton } from "@/components/ui/skeleton";
 import { timeAgo, fullTimestamp } from "@/lib/time-ago";
 import { useNow } from "@/lib/use-now";
+import { AutomationFrame } from "@/components/nav/automation-frame";
 import { Loader2, RefreshCw } from "lucide-react";
 import {
   AlertDialog,
@@ -197,18 +198,16 @@ export default function ApprovalsPage() {
   const tenantLabel = clinic?.name ?? "";
 
   return (
+    <AutomationFrame active="approvals">
     <div className="space-y-6">
       {/* Toaster is mounted once at the root layout (Sonner). */}
 
-      {/* Header sticks to the top while the queue scrolls. The
-          AppShell already pins its own nav bar at top:0 / h-14, so we
-          start at top-14 to sit flush below it. -mx-4 + px-4 lets the
-          sticky bar's background span edge-to-edge of the content
-          column instead of leaving stripes on the sides. */}
-      <div className="sticky top-14 z-30 -mx-4 sm:-mx-6 px-4 sm:px-6 py-3 bg-gray-50/95 backdrop-blur-sm border-b border-slate-200/60 flex items-center justify-between">
+      {/* Counter row — the page-level "⚡ Automation" + tab strip is
+          rendered by AutomationFrame above this. The old sticky header
+          duplicated that hierarchy; replaced with a slim summary line. */}
+      <div className="flex items-center justify-between">
         <div>
-          <h1 className="text-2xl font-bold tracking-tight text-slate-900">Approval Queue</h1>
-          <p className="text-[13px] text-slate-500 mt-1">
+          <p className="text-sm" style={{ color: "var(--p-slate)" }}>
             {tenantLabel ? `${tenantLabel} · ` : ""}
             {filtered.length} pending approval{filtered.length === 1 ? "" : "s"}
           </p>
@@ -244,7 +243,7 @@ export default function ApprovalsPage() {
         </div>
       ) : filtered.length === 0 ? (
         <Card>
-          <CardContent className="flex flex-col items-center py-12 text-center">
+          <CardContent className="flex flex-col items-center py-8 text-center">
             <div className="rounded-full bg-emerald-50 p-3 mb-3 ring-1 ring-emerald-100">
               <svg className="h-6 w-6 text-emerald-600" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
                 <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
@@ -283,6 +282,7 @@ export default function ApprovalsPage() {
         </div>
       )}
     </div>
+    </AutomationFrame>
   );
 }
 
