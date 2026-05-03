@@ -48,6 +48,22 @@ jobs:
           --health-interval 5s
           --health-timeout 3s
           --health-retries 12
+      mysql:
+        # Backend datasource. Mirrors pulsar-backend/docker-compose.yml's
+        # mysql service: port 3316 on the runner -> 3306 in container,
+        # creds root/pulsar, with `pulsar_platform` pre-created so the
+        # first Flyway run lands on a real DB. Per-tenant DBs are
+        # created via createDatabaseIfNotExist on demand.
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: pulsar
+          MYSQL_DATABASE: pulsar_platform
+        ports: ["3316:3306"]
+        options: >-
+          --health-cmd "mysqladmin ping -h localhost -uroot -ppulsar"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
 
     steps:
       - uses: actions/checkout@v4
@@ -139,7 +155,7 @@ jobs:
         # images to a registry, this becomes a `docker pull`.
         # The Dockerfile builds the dental-domain bootJar.
         env:
-          PULSAR_BACKEND_REPO: ${{ vars.PULSAR_BACKEND_REPO || 'webozenservices/pulsar-backend' }}
+          PULSAR_BACKEND_REPO: ${{ vars.PULSAR_BACKEND_REPO || 'webozen/pulsar-backend' }}
         run: |
           git clone --depth 1 "https://github.com/${PULSAR_BACKEND_REPO}.git" /tmp/pulsar-backend
           cd /tmp/pulsar-backend
@@ -148,6 +164,11 @@ jobs:
             --network host \
             -e SERVER_PORT=18080 \
             -e SPRING_DATASOURCE_URL='jdbc:mysql://localhost:3316/pulsar_platform?useSSL=false&allowPublicKeyRetrieval=true&createDatabaseIfNotExist=true' \
+            -e SPRING_DATASOURCE_USERNAME=root \
+            -e SPRING_DATASOURCE_PASSWORD=pulsar \
+            -e PULSAR_MYSQL_BASE_JDBC_URL='jdbc:mysql://localhost:3316' \
+            -e PULSAR_MYSQL_USER=root \
+            -e PULSAR_MYSQL_PASSWORD=pulsar \
             -e PULSAR_TENANT_BASE_JDBC_URL='jdbc:mysql://localhost:3316' \
             -e PULSAR_ADMIN_PASSCODE='PULS-DEV-0000' \
             -e PULSAR_JWT_SECRET='ci-e2e-nightly-jwt-secret-32plus-chars-not-the-dev-sentinel' \
