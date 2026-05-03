@@ -111,14 +111,16 @@ jobs:
       - name: Build & start Next.js app
         # Env block is required at BOTH build and start: `next build`'s
         # page-data collection evaluates server modules in production
-        # mode, and `app/src/lib/{kestra,opendental}.ts` resolve their
-        # URLs through `requireEnv` which throws when NODE_ENV=production
-        # and the var is unset (the dev defaults are intentionally
-        # ignored in prod — see app/src/lib/env.ts).
+        # mode, so `app/src/lib/{kestra,opendental}.ts` (requireEnv) and
+        # `app/src/lib/pulsar-auth.ts` (JWT secret guard) all run their
+        # production-mode checks. JWT secret must NOT equal the public
+        # dev sentinel — pulsar-auth refuses to boot if it does — and
+        # must match what the pulsar-backend docker-run uses below so
+        # tokens round-trip between orchestrator and backend.
         env:
           KESTRA_API_URL: http://localhost:8080
           OPENDENTAL_API_BASE: https://api.opendental.com/api/v1
-          PULSAR_JWT_SECRET: dev-secret-change-me-please-32bytes-minimum-abcdefgh
+          PULSAR_JWT_SECRET: ci-e2e-nightly-jwt-secret-32plus-chars-not-the-dev-sentinel
           PULSAR_AUTOMATION_SYNC_SECRET: dev-sync-secret
           PULSAR_BACKEND_URL: http://localhost:18080
         run: |
@@ -148,7 +150,7 @@ jobs:
             -e SPRING_DATASOURCE_URL='jdbc:mysql://localhost:3316/pulsar_platform?useSSL=false&allowPublicKeyRetrieval=true&createDatabaseIfNotExist=true' \
             -e PULSAR_TENANT_BASE_JDBC_URL='jdbc:mysql://localhost:3316' \
             -e PULSAR_ADMIN_PASSCODE='PULS-DEV-0000' \
-            -e PULSAR_JWT_SECRET='dev-secret-change-me-please-32bytes-minimum-abcdefgh' \
+            -e PULSAR_JWT_SECRET='ci-e2e-nightly-jwt-secret-32plus-chars-not-the-dev-sentinel' \
             -e PULSAR_AUTOMATION_BASE_URL='http://localhost:3002/automation' \
             -e PULSAR_AUTOMATION_SYNC_SECRET='dev-sync-secret' \
             pulsar-backend:dental
