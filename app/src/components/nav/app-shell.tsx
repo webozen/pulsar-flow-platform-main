@@ -28,8 +28,17 @@ function NavIcon({ d }: { d: string }) {
 
 export function AppShell({ children, userName }: { children: React.ReactNode; userName?: string | null }) {
   const pathname = usePathname()
-  const pulsarUrl = process.env.NEXT_PUBLIC_PULSAR_APP_URL || 'http://localhost:5173'
+  const pulsarBase = process.env.NEXT_PUBLIC_PULSAR_APP_URL || 'http://localhost:5173'
   const branding = useBranding()
+
+  // Deep-link "Back to Pulsar" to the tenant home so the user lands inside
+  // their already-authenticated tenant shell instead of bouncing through
+  // the unauthenticated `/` → `/login` redirect. Slug comes from the URL —
+  // every page under /clinics/<slug>/ has it; routes without a slug fall
+  // back to the root and rely on Pulsar's HomeRedirect to land them.
+  const slugMatch = pathname.match(/^\/clinics\/([^/]+)/)
+  const slug = slugMatch ? slugMatch[1] : null
+  const pulsarUrl = slug ? `${pulsarBase}/t/${slug}` : pulsarBase
 
   // Branded chrome — logo + app name fall back to the legacy "Pulsar
   // Flow" treatment when the branding endpoint isn't reachable. The
