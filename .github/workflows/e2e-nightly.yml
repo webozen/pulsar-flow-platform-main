@@ -175,22 +175,48 @@ jobs:
             -e PULSAR_AUTOMATION_BASE_URL='http://localhost:3002/automation' \
             -e PULSAR_AUTOMATION_SYNC_SECRET='dev-sync-secret' \
             pulsar-backend:dental
-          # Wait for the backend admin login endpoint to come up.
+          # Wait for the backend admin login endpoint to come up. Fail
+          # the step explicitly if it doesn't — silent success here was
+          # masking real backend boot failures and only surfacing as
+          # ECONNREFUSED in the Playwright step.
           for i in {1..40}; do
-            if curl -fsS -X POST http://localhost:18080/api/admin/login \
+            if curl -fsS -X POST http://127.0.0.1:18080/api/admin/login \
               -H 'Content-Type: application/json' \
-              -d '{"passcode":"PULS-DEV-0000"}' >/dev/null 2>&1; then break; fi
+              -d '{"passcode":"PULS-DEV-0000"}' >/dev/null 2>&1; then
+              echo "Backend ready after ${i} attempts"
+              break
+            fi
+            if [ "$i" -eq 40 ]; then
+              echo "::error::Backend did not become healthy within 2 minutes"
+              echo "--- pulsar-backend container status ---"
+              docker ps -a --filter name=pulsar-backend
+              echo "--- pulsar-backend logs (last 200 lines) ---"
+              docker logs pulsar-backend 2>&1 | tail -200 || true
+              echo "--- mysql logs (last 50 lines) ---"
+              docker ps -a --filter "ancestor=mysql:8.0" --format '{{.Names}}' \
+                | head -1 | xargs -I {} docker logs {} 2>&1 | tail -50 || true
+              exit 1
+            fi
             sleep 3
           done
 
       - name: Provision the test tenant
         run: |
-          TOKEN=$(curl -s -X POST http://localhost:18080/api/admin/login \
+          # `set -e` is bash-default in steps; `-o pipefail` makes the
+          # `curl | jq` chain fail if curl errors. We additionally
+          # validate the token came back non-empty.
+          set -euo pipefail
+          LOGIN_RESP=$(curl -fsS -X POST http://127.0.0.1:18080/api/admin/login \
             -H 'Content-Type: application/json' \
-            -d '{"passcode":"PULS-DEV-0000"}' | jq -r .token)
+            -d '{"passcode":"PULS-DEV-0000"}')
+          TOKEN=$(echo "$LOGIN_RESP" | jq -r .token)
+          if [ -z "$TOKEN" ] || [ "$TOKEN" = "null" ]; then
+            echo "::error::Admin login returned no token: $LOGIN_RESP"
+            exit 1
+          fi
           # Create acme-dental and activate the automation module so
           # tenant-sync provisions the (currently empty) flows dir.
-          curl -s -X POST http://localhost:18080/api/admin/tenants \
+          curl -fsS -X POST http://127.0.0.1:18080/api/admin/tenants \
             -H "Authorization: Bearer $TOKEN" \
             -H 'Content-Type: application/json' \
             -d '{"slug":"acme-dental","name":"Acme Dental","modules":["automation"],"contactEmail":"ci@acme.test"}' \
