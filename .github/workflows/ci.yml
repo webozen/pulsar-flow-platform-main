@@ -56,28 +56,31 @@ jobs:
         run: docker compose up -d
 
       - name: Wait for Kestra
+        # Probe accepts any HTTP response from Kestra — once the webserver is
+        # answering at all (even 405 on the bare /api/v1/flows route, which is
+        # what Kestra returns when no query params are supplied) the process
+        # is up. Don't pin a specific 2xx endpoint — Kestra's route shapes
+        # change between minor versions.
         run: |
           for i in $(seq 1 60); do
-            curl -sf http://localhost:8080/api/v1/flows >/dev/null 2>&1 && break
+            code=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8080/api/v1/flows 2>/dev/null || echo 000)
+            if [ "$code" != "000" ]; then
+              echo "Kestra responded with HTTP $code (boot complete)"
+              break
+            fi
             sleep 2
           done
-          curl -sf http://localhost:8080/api/v1/flows >/dev/null 2>&1 || \
-            { echo "Kestra did not start"; docker compose logs kestra; exit 1; }
+          code=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8080/api/v1/flows 2>/dev/null || echo 000)
+          if [ "$code" = "000" ]; then
+            echo "Kestra did not start"
+            docker compose logs kestra
+            exit 1
+          fi
 
-      - name: Load flows
-        run: |
-          for f in kestra/flows/dental/*.yml; do
-            echo "Loading $f..."
-            curl -sf -X POST http://localhost:8080/api/v1/flows \
-              -H "Content-Type: application/x-yaml" \
-              --data-binary @"$f" || echo "WARNING: failed to load $f"
-          done
-
-      - name: Verify flow count
-        run: |
-          count=$(curl -sf http://localhost:8080/api/v1/flows/dental | python3 -c "import sys,json; print(len(json.load(sys.stdin)))")
-          echo "Loaded $count flows"
-          [ "$count" -ge 4 ] || { echo "Expected at least 4 flows"; exit 1; }
+      # Flow loading + count verification removed: workflows are no longer
+      # shipped as static YAML in `kestra/flows/dental/`. The orchestrator
+      # generates them at deploy time (see app/src/lib/workflow-generator.ts).
+      # Full flow-lifecycle smoke is covered by `e2e-nightly.yml`.
 
       - name: Cleanup
         if: always()
