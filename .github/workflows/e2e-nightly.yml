@@ -28,6 +28,13 @@ jobs:
       run:
         working-directory: app
 
+    # Kestra used to live here as a service container, but GitHub Actions
+    # services don't support passing a CMD, and `kestra/kestra:v0.19.x`
+    # needs `server standalone` explicitly — without it, the container
+    # prints CLI help and exits, failing the service health check. We now
+    # run Kestra as a docker container in a step (the same pattern this
+    # workflow already uses for pulsar-backend), which lets us pass the
+    # right CMD and have full control over startup ordering.
     services:
       postgres:
         image: postgres:15
@@ -41,31 +48,22 @@ jobs:
           --health-interval 5s
           --health-timeout 3s
           --health-retries 12
-      kestra:
-        image: kestra/kestra:v0.19.11
+      mysql:
+        # Backend datasource. Mirrors pulsar-backend/docker-compose.yml's
+        # mysql service: port 3316 on the runner -> 3306 in container,
+        # creds root/pulsar, with `pulsar_platform` pre-created so the
+        # first Flyway run lands on a real DB. Per-tenant DBs are
+        # created via createDatabaseIfNotExist on demand.
+        image: mysql:8.0
         env:
-          KESTRA_CONFIGURATION: |
-            datasources:
-              postgres:
-                url: jdbc:postgresql://postgres:5432/kestra
-                driverClassName: org.postgresql.Driver
-                username: kestra
-                password: k3stra_dev
-            kestra:
-              repository:
-                type: postgres
-              queue:
-                type: postgres
-              storage:
-                type: local
-                local:
-                  base-path: /tmp/kestra
-        ports: ["8080:8080"]
+          MYSQL_ROOT_PASSWORD: pulsar
+          MYSQL_DATABASE: pulsar_platform
+        ports: ["3316:3306"]
         options: >-
-          --health-cmd "curl -fsS http://localhost:8080/api/v1/flows/search?size=1 || exit 1"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 30
+          --health-cmd "mysqladmin ping -h localhost -uroot -ppulsar"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
 
     steps:
       - uses: actions/checkout@v4
@@ -75,10 +73,72 @@ jobs:
           cache: npm
           cache-dependency-path: app/package-lock.json
 
+      - name: Start Kestra (as a step, not a service)
+        # `services:` block can't pass a CMD, but Kestra needs `server
+        # standalone` or it prints help and exits. Running as a plain
+        # docker container with --network host so it reaches the
+        # `services.postgres` container at localhost:5432 and binds its
+        # own :8080 on the runner for downstream steps.
+        working-directory: ${{ github.workspace }}
+        run: |
+          # KESTRA_CONFIGURATION uses localhost (not "postgres") because
+          # we're in --network host mode; the postgres service is bound
+          # to localhost:5432 on the runner via its ports mapping.
+          docker run -d --name kestra \
+            --network host \
+            -e KESTRA_CONFIGURATION="$(cat <<'YAML'
+          datasources:
+            postgres:
+              url: jdbc:postgresql://localhost:5432/kestra
+              driverClassName: org.postgresql.Driver
+              username: kestra
+              password: k3stra_dev
+          kestra:
+            repository:
+              type: postgres
+            queue:
+              type: postgres
+            storage:
+              type: local
+              local:
+                base-path: /tmp/kestra
+          YAML
+          )" \
+            kestra/kestra:v0.19.11 \
+            server standalone --worker-thread=10
+          # Wait for Kestra's API to come up — Flyway runs migrations on
+          # first boot which adds ~30s; give it generous retries.
+          for i in {1..60}; do
+            if curl -fsS http://localhost:8080/api/v1/configs >/dev/null 2>&1; then
+              echo "Kestra ready after ${i} attempts"
+              break
+            fi
+            if [ "$i" -eq 60 ]; then
+              echo "::error::Kestra did not become healthy within 5 minutes"
+              docker logs kestra | tail -100
+              exit 1
+            fi
+            sleep 5
+          done
+
       - run: npm ci
       - run: npx playwright install --with-deps chromium
 
       - name: Build & start Next.js app
+        # Env block is required at BOTH build and start: `next build`'s
+        # page-data collection evaluates server modules in production
+        # mode, so `app/src/lib/{kestra,opendental}.ts` (requireEnv) and
+        # `app/src/lib/pulsar-auth.ts` (JWT secret guard) all run their
+        # production-mode checks. JWT secret must NOT equal the public
+        # dev sentinel — pulsar-auth refuses to boot if it does — and
+        # must match what the pulsar-backend docker-run uses below so
+        # tokens round-trip between orchestrator and backend.
+        env:
+          KESTRA_API_URL: http://localhost:8080
+          OPENDENTAL_API_BASE: https://api.opendental.com/api/v1
+          PULSAR_JWT_SECRET: ci-e2e-nightly-jwt-secret-32plus-chars-not-the-dev-sentinel
+          PULSAR_AUTOMATION_SYNC_SECRET: dev-sync-secret
+          PULSAR_BACKEND_URL: http://localhost:18080
         run: |
           npm run build
           nohup npm run start -- -p 3002 >/tmp/app.log 2>&1 &
@@ -95,7 +155,7 @@ jobs:
         # images to a registry, this becomes a `docker pull`.
         # The Dockerfile builds the dental-domain bootJar.
         env:
-          PULSAR_BACKEND_REPO: ${{ vars.PULSAR_BACKEND_REPO || 'webozenservices/pulsar-backend' }}
+          PULSAR_BACKEND_REPO: ${{ vars.PULSAR_BACKEND_REPO || 'webozen/pulsar-backend' }}
         run: |
           git clone --depth 1 "https://github.com/${PULSAR_BACKEND_REPO}.git" /tmp/pulsar-backend
           cd /tmp/pulsar-backend
@@ -104,39 +164,75 @@ jobs:
             --network host \
             -e SERVER_PORT=18080 \
             -e SPRING_DATASOURCE_URL='jdbc:mysql://localhost:3316/pulsar_platform?useSSL=false&allowPublicKeyRetrieval=true&createDatabaseIfNotExist=true' \
+            -e SPRING_DATASOURCE_USERNAME=root \
+            -e SPRING_DATASOURCE_PASSWORD=pulsar \
+            -e PULSAR_MYSQL_BASE_JDBC_URL='jdbc:mysql://localhost:3316' \
+            -e PULSAR_MYSQL_USER=root \
+            -e PULSAR_MYSQL_PASSWORD=pulsar \
             -e PULSAR_TENANT_BASE_JDBC_URL='jdbc:mysql://localhost:3316' \
             -e PULSAR_ADMIN_PASSCODE='PULS-DEV-0000' \
-            -e PULSAR_JWT_SECRET='dev-secret-change-me-please-32bytes-minimum-abcdefgh' \
+            -e PULSAR_JWT_SECRET='ci-e2e-nightly-jwt-secret-32plus-chars-not-the-dev-sentinel' \
             -e PULSAR_AUTOMATION_BASE_URL='http://localhost:3002/automation' \
             -e PULSAR_AUTOMATION_SYNC_SECRET='dev-sync-secret' \
             pulsar-backend:dental
-          # Wait for the backend admin login endpoint to come up.
+          # Wait for the backend admin login endpoint to come up. Fail
+          # the step explicitly if it doesn't — silent success here was
+          # masking real backend boot failures and only surfacing as
+          # ECONNREFUSED in the Playwright step.
           for i in {1..40}; do
-            if curl -fsS -X POST http://localhost:18080/api/admin/login \
+            if curl -fsS -X POST http://127.0.0.1:18080/api/admin/login \
               -H 'Content-Type: application/json' \
-              -d '{"passcode":"PULS-DEV-0000"}' >/dev/null 2>&1; then break; fi
+              -d '{"passcode":"PULS-DEV-0000"}' >/dev/null 2>&1; then
+              echo "Backend ready after ${i} attempts"
+              break
+            fi
+            if [ "$i" -eq 40 ]; then
+              echo "::error::Backend did not become healthy within 2 minutes"
+              echo "--- pulsar-backend container status ---"
+              docker ps -a --filter name=pulsar-backend
+              echo "--- pulsar-backend logs (last 200 lines) ---"
+              docker logs pulsar-backend 2>&1 | tail -200 || true
+              echo "--- mysql logs (last 50 lines) ---"
+              docker ps -a --filter "ancestor=mysql:8.0" --format '{{.Names}}' \
+                | head -1 | xargs -I {} docker logs {} 2>&1 | tail -50 || true
+              exit 1
+            fi
             sleep 3
           done
 
       - name: Provision the test tenant
         run: |
-          TOKEN=$(curl -s -X POST http://localhost:18080/api/admin/login \
+          # `set -e` is bash-default in steps; `-o pipefail` makes the
+          # `curl | jq` chain fail if curl errors. We additionally
+          # validate the token came back non-empty.
+          set -euo pipefail
+          LOGIN_RESP=$(curl -fsS -X POST http://127.0.0.1:18080/api/admin/login \
             -H 'Content-Type: application/json' \
-            -d '{"passcode":"PULS-DEV-0000"}' | jq -r .token)
+            -d '{"passcode":"PULS-DEV-0000"}')
+          TOKEN=$(echo "$LOGIN_RESP" | jq -r .token)
+          if [ -z "$TOKEN" ] || [ "$TOKEN" = "null" ]; then
+            echo "::error::Admin login returned no token: $LOGIN_RESP"
+            exit 1
+          fi
           # Create acme-dental and activate the automation module so
           # tenant-sync provisions the (currently empty) flows dir.
-          curl -s -X POST http://localhost:18080/api/admin/tenants \
+          curl -fsS -X POST http://127.0.0.1:18080/api/admin/tenants \
             -H "Authorization: Bearer $TOKEN" \
             -H 'Content-Type: application/json' \
             -d '{"slug":"acme-dental","name":"Acme Dental","modules":["automation"],"contactEmail":"ci@acme.test"}' \
             | jq .
 
+      # URLs use 127.0.0.1 (not `localhost`) because Node 17+ resolves
+      # `localhost` to IPv6 ::1 first, and the backend container started
+      # via `docker run --network host` on a Linux runner only binds to
+      # IPv4. Without this, Playwright fails with `ECONNREFUSED ::1:18080`
+      # even though curl from the same step connects fine (curl prefers IPv4).
       - name: Run Playwright (default — sends 1 SMS in the no-crosstalk test)
         if: ${{ inputs.run_live_twilio != 'true' }}
         env:
-          PULSAR_BACKEND_URL: http://localhost:18080
-          PULSAR_FLOW_APP_URL: http://localhost:3002
-          KESTRA_URL: http://localhost:8080
+          PULSAR_BACKEND_URL: http://127.0.0.1:18080
+          PULSAR_FLOW_APP_URL: http://127.0.0.1:3002
+          KESTRA_URL: http://127.0.0.1:8080
           PULSAR_ADMIN_PASSCODE: PULS-DEV-0000
           TEST_TENANT_SLUG: acme-dental
         run: npx playwright test approvals.spec.ts --workers=1
@@ -144,9 +240,9 @@ jobs:
       - name: Run Playwright (with live Twilio delivery confirmation)
         if: ${{ inputs.run_live_twilio == 'true' }}
         env:
-          PULSAR_BACKEND_URL: http://localhost:18080
-          PULSAR_FLOW_APP_URL: http://localhost:3002
-          KESTRA_URL: http://localhost:8080
+          PULSAR_BACKEND_URL: http://127.0.0.1:18080
+          PULSAR_FLOW_APP_URL: http://127.0.0.1:3002
+          KESTRA_URL: http://127.0.0.1:8080
           PULSAR_ADMIN_PASSCODE: PULS-DEV-0000
           TEST_TENANT_SLUG: acme-dental
           RUN_LIVE_TWILIO: "1"
