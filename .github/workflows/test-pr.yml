@@ -7,9 +7,9 @@ name: test-pr
 
 on:
   pull_request:
-    branches: [main]
+    branches: [master, main]
   push:
-    branches: [main]
+    branches: [master, main]
 
 concurrency:
   # Cancel duplicate runs for the same PR — only the latest commit's
